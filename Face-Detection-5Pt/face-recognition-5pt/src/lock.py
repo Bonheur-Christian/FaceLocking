@@ -10,15 +10,11 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-try:
-    import mediapipe as mp
-except ImportError:
-    mp = None
-
 from . import config
 from .haar_5pt import HaarMediaPipeFaceDetector, FaceDetection
 from .align import FaceAligner
 from .embed import ArcFaceEmbedder
+from . import actions as action_module
 
 
 def load_database():
@@ -36,46 +32,9 @@ def cosine_distance(a, b):
     return 1.0 - float(np.dot(a, b))
 
 
-def _ear_from_landmarks(landmarks_list, indices, W, H):
-    """Eye Aspect Ratio from 6 landmark indices."""
-    pts = []
-    for i in indices:
-        lm = landmarks_list[i]
-        pts.append((lm.x * W, lm.y * H))
-    p1, p2, p3, p4, p5, p6 = [np.array(p) for p in pts]
-    v1 = np.linalg.norm(p2 - p6)
-    v2 = np.linalg.norm(p3 - p5)
-    h = np.linalg.norm(p1 - p4)
-    if h < 1e-6:
-        return 0.5
-    return (v1 + v2) / (2.0 * h)
-
-
-def _mouth_width_from_landmarks(landmarks_list, left_idx, right_idx, W, H):
-    """Mouth width in pixels."""
-    l = landmarks_list[left_idx]
-    r = landmarks_list[right_idx]
-    return np.hypot((r.x - l.x) * W, (r.y - l.y) * H)
-
-
 def get_full_landmarks(frame):
     """Run MediaPipe Face Mesh on frame; return first face landmark list or None."""
-    if mp is None:
-        return None
-    H, W = frame.shape[:2]
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    mesh = mp.solutions.face_mesh.FaceMesh(
-        static_image_mode=False,
-        max_num_faces=1,
-        refine_landmarks=True,
-        min_detection_confidence=0.5,
-        min_tracking_confidence=0.5,
-    )
-    results = mesh.process(rgb)
-    mesh.close()
-    if not results.multi_face_landmarks:
-        return None
-    return results.multi_face_landmarks[0].landmark
+    return action_module.get_face_mesh_landmarks(frame)
 
 
 def detect_actions(frame, prev_center_x, center_x, prev_ear, prev_mouth_width,
@@ -100,18 +59,13 @@ def detect_actions(frame, prev_center_x, center_x, prev_ear, prev_mouth_width,
     if landmarks_list is None:
         return actions
 
-    ear_left = _ear_from_landmarks(landmarks_list, config.LOCK_EAR_LEFT_INDICES, W, H)
-    ear_right = _ear_from_landmarks(landmarks_list, config.LOCK_EAR_RIGHT_INDICES, W, H)
-    ear = (ear_left + ear_right) / 2.0
-
+    ear = action_module.compute_ear(landmarks_list, W, H)
     if ear < config.LOCK_EAR_BLINK_THRESHOLD:
         if frame_idx - last_action_frame.get("eye_blink", -999) >= cooldown:
             actions.append(("eye_blink", "eye blink"))
             last_action_frame["eye_blink"] = frame_idx
 
-    mouth_width = _mouth_width_from_landmarks(
-        landmarks_list, config.LOCK_MOUTH_LEFT_INDEX, config.LOCK_MOUTH_RIGHT_INDEX, W, H
-    )
+    mouth_width = action_module.compute_mouth_width(landmarks_list, W, H)
     if baseline_mouth_width is not None and baseline_mouth_width > 1.0:
         if mouth_width >= baseline_mouth_width * config.LOCK_SMILE_MOUTH_RATIO:
             if frame_idx - last_action_frame.get("smile", -999) >= cooldown:
@@ -265,13 +219,8 @@ def main():
 
                     landmarks_list = get_full_landmarks(frame)
                     if landmarks_list:
-                        mw = _mouth_width_from_landmarks(
-                            landmarks_list, config.LOCK_MOUTH_LEFT_INDEX,
-                            config.LOCK_MOUTH_RIGHT_INDEX, W, H
-                        )
-                        ear_left = _ear_from_landmarks(landmarks_list, config.LOCK_EAR_LEFT_INDICES, W, H)
-                        ear_right = _ear_from_landmarks(landmarks_list, config.LOCK_EAR_RIGHT_INDICES, W, H)
-                        prev_ear = (ear_left + ear_right) / 2.0
+                        mw = action_module.compute_mouth_width(landmarks_list, W, H)
+                        prev_ear = action_module.compute_ear(landmarks_list, W, H)
                         mouth_width_samples.append(mw)
                         if len(mouth_width_samples) > 30:
                             mouth_width_samples.pop(0)
