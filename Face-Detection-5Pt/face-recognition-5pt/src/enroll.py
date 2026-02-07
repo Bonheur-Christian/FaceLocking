@@ -75,7 +75,7 @@ def main():
                     pass
         print(f"Loaded {len(existing_samples)} existing samples.")
     
-    cap = cv2.VideoCapture(0)
+    cap = cv2.VideoCapture(2)
     if not cap.isOpened():
         print("ERROR: Cannot open camera.")
         return False

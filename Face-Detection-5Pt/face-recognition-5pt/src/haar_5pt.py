@@ -42,7 +42,7 @@ class HaarMediaPipeFaceDetector:
         
         self.mesh = mp.solutions.face_mesh.FaceMesh(
             static_image_mode=config.FACEMESH_STATIC_MODE,
-            max_num_faces=1,
+            max_num_faces=5,  # Support up to 5 faces simultaneously
             refine_landmarks=config.FACEMESH_REFINE_LANDMARKS,
             min_detection_confidence=config.FACEMESH_MIN_DETECTION_CONFIDENCE,
             min_tracking_confidence=config.FACEMESH_MIN_TRACKING_CONFIDENCE,
@@ -90,7 +90,7 @@ class HaarMediaPipeFaceDetector:
     
     def detect(self, frame):
         """
-        Detect faces in frame.
+        Detect faces in frame. Supports multiple faces simultaneously.
         
         Args:
             frame: BGR image
@@ -112,70 +112,82 @@ class HaarMediaPipeFaceDetector:
         if len(haar_faces) == 0:
             return []
         
-        # Take largest face
-        areas = haar_faces[:, 2] * haar_faces[:, 3]
-        best_idx = int(np.argmax(areas))
-        x, y, w, h = haar_faces[best_idx]
-        
-        # FaceMesh confirmation
+        # FaceMesh confirmation - process all faces
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = self.mesh.process(rgb)
         
         if not results.multi_face_landmarks:
             return []
         
-        # Extract 5 landmarks
-        landmarks_full = results.multi_face_landmarks[0].landmark
+        # Process each MediaPipe face and match to Haar detections
+        detected_faces = []
         
-        kps = []
-        indices = [
-            config.LANDMARK_INDICES["left_eye"],
-            config.LANDMARK_INDICES["right_eye"],
-            config.LANDMARK_INDICES["nose_tip"],
-            config.LANDMARK_INDICES["mouth_left"],
-            config.LANDMARK_INDICES["mouth_right"],
-        ]
-        
-        for idx in indices:
-            lm = landmarks_full[idx]
-            kps.append([lm.x * W, lm.y * H])
-        
-        kps = np.array(kps, dtype=np.float32)
-        
-        # Enforce ordering
-        if kps[0, 0] > kps[1, 0]:
-            kps[[0, 1]] = kps[[1, 0]]
-        if kps[3, 0] > kps[4, 0]:
-            kps[[3, 4]] = kps[[4, 3]]
-        
-        # Validate geometry
-        if not self._validate_landmarks_geometry(kps):
-            return []
-        
-        # Check if landmarks are inside Haar box
-        if config.KPS_MUST_BE_IN_HAAR_BOX:
-            margin = config.KPS_IN_BOX_MARGIN
-            x1m = x - margin * w
-            y1m = y - margin * h
-            x2m = x + (1.0 + margin) * w
-            y2m = y + (1.0 + margin) * h
+        for face_landmarks in results.multi_face_landmarks:
+            # Extract 5 landmarks
+            landmarks_full = face_landmarks.landmark
             
-            inside = (
-                (kps[:, 0] >= x1m) & (kps[:, 0] <= x2m) &
-                (kps[:, 1] >= y1m) & (kps[:, 1] <= y2m)
-            )
+            kps = []
+            indices = [
+                config.LANDMARK_INDICES["left_eye"],
+                config.LANDMARK_INDICES["right_eye"],
+                config.LANDMARK_INDICES["nose_tip"],
+                config.LANDMARK_INDICES["mouth_left"],
+                config.LANDMARK_INDICES["mouth_right"],
+            ]
             
-            if inside.mean() < config.KPS_IN_BOX_MIN_RATIO:
-                return []
-        
-        # Build bbox from landmarks
-        bbox = self._bbox_from_landmarks(kps)
-        x1, y1, x2, y2 = self._clip_bbox(bbox, H, W)
-        
-        return [
-            FaceDetection(
-                x1=x1, y1=y1, x2=x2, y2=y2,
-                score=1.0,
-                landmarks=kps.astype(np.float32)
+            for idx in indices:
+                lm = landmarks_full[idx]
+                kps.append([lm.x * W, lm.y * H])
+            
+            kps = np.array(kps, dtype=np.float32)
+            
+            # Enforce ordering
+            if kps[0, 0] > kps[1, 0]:
+                kps[[0, 1]] = kps[[1, 0]]
+            if kps[3, 0] > kps[4, 0]:
+                kps[[3, 4]] = kps[[4, 3]]
+            
+            # Validate geometry
+            if not self._validate_landmarks_geometry(kps):
+                continue
+            
+            # Find which Haar box this face belongs to (if any)
+            matched_haar = None
+            best_overlap = 0
+            
+            for x, y, w, h in haar_faces:
+                # Check if landmarks are inside this Haar box
+                if config.KPS_MUST_BE_IN_HAAR_BOX:
+                    margin = config.KPS_IN_BOX_MARGIN
+                    x1m = x - margin * w
+                    y1m = y - margin * h
+                    x2m = x + (1.0 + margin) * w
+                    y2m = y + (1.0 + margin) * h
+                    
+                    inside = (
+                        (kps[:, 0] >= x1m) & (kps[:, 0] <= x2m) &
+                        (kps[:, 1] >= y1m) & (kps[:, 1] <= y2m)
+                    )
+                    
+                    overlap = inside.mean()
+                    if overlap > best_overlap and overlap >= config.KPS_IN_BOX_MIN_RATIO:
+                        best_overlap = overlap
+                        matched_haar = (x, y, w, h)
+            
+            # Skip if no matching Haar box found
+            if matched_haar is None and config.KPS_MUST_BE_IN_HAAR_BOX:
+                continue
+            
+            # Build bbox from landmarks
+            bbox = self._bbox_from_landmarks(kps)
+            x1, y1, x2, y2 = self._clip_bbox(bbox, H, W)
+            
+            detected_faces.append(
+                FaceDetection(
+                    x1=x1, y1=y1, x2=x2, y2=y2,
+                    score=1.0,
+                    landmarks=kps.astype(np.float32)
+                )
             )
-        ]
+        
+        return detected_faces

@@ -107,7 +107,7 @@ ACCEPT_HOLD_FRAMES = 3  # Hold "accepted" state for N frames
 # CAMERA SETTINGS
 # ============================================================================
 
-CAMERA_INDEX = 0  # Default: first camera
+CAMERA_INDEX = 0 # Default: first camera
 CAMERA_FRAME_WIDTH = 640
 CAMERA_FRAME_HEIGHT = 480
 CAMERA_FPS_TARGET = 30

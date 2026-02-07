@@ -72,8 +72,13 @@ def cosine_distance(a: np.ndarray, b: np.ndarray) -> float:
     return 1.0 - similarity
 
 
-def main():
-    """Live recognition pipeline."""
+def main(start_fullscreen: bool = False):
+    """
+    Live recognition pipeline.
+    
+    Args:
+        start_fullscreen: If True, start in fullscreen mode
+    """
     db = load_database()
     
     if not db:
@@ -97,18 +102,36 @@ def main():
     else:
         print("Lock: (none) – all enrolled identities shown by name")
     
-    cap = cv2.VideoCapture(config.CAMERA_INDEX)
-    if not cap.isOpened():
-        print("ERROR: Cannot open camera.")
+    # Try to open camera with robust error handling
+    cap = None
+    for attempt in range(3):
+        cap = cv2.VideoCapture(config.CAMERA_INDEX)
+        if cap.isOpened():
+            break
+        cap.release()
+        if attempt < 2:
+            print(f"Attempt {attempt + 1}/3: Camera not ready, retrying...")
+            import time
+            time.sleep(1)
+    
+    if not cap or not cap.isOpened():
+        print("ERROR: Cannot open camera after 3 attempts.")
+        print(f"Please check if camera is connected and try another index.")
+        print(f"Run: python src/camera_utils.py to find the correct camera index.")
         return False
+
+
+    
     
     threshold = config.DEFAULT_DISTANCE_THRESHOLD
     
     print("\nLive Recognition (smile & blink detection enabled)")
+    print("Window: Large resizable window (can be maximized)")
     print("Controls:")
     print("  q  - Quit")
     print("  r  - Reload database")
     print("  l  - Clear lock (accept all)")
+    print("  f  - Toggle fullscreen (RECOMMENDED for full screen)")
     print("  +  - Increase threshold (more accepts)")
     print("  -  - Decrease threshold (fewer accepts)")
     
@@ -119,6 +142,22 @@ def main():
     frame_idx = 0
     action_display: List[Tuple[str, int]] = []  # (label, frames_remaining)
     ACTION_DISPLAY_DURATION = 20  # show "Blink!" / "Smile!" for this many frames
+    
+    # Fullscreen state
+    is_fullscreen = start_fullscreen
+    window_name = "Live Recognition"
+    
+    # Create window with NORMAL flag to allow resizing and maximize
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
+    
+    # Set to a large default size (1920x1080 for Full HD)
+    # User can maximize or fullscreen as needed
+    cv2.resizeWindow(window_name, 1920, 1080)
+    
+    # Apply fullscreen if requested
+    if start_fullscreen:
+        cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+        print("Starting in FULLSCREEN mode (press 'f' to exit fullscreen)")
     
     try:
         import time
@@ -155,12 +194,6 @@ def main():
             action_display = [(label, n - 1) for label, n in action_display if n > 1]
             
             for face_idx, face in enumerate(faces):
-                # Draw bbox + landmarks
-                cv2.rectangle(vis, (face.x1, face.y1), (face.x2, face.y2), (0, 255, 0), 2)
-                
-                for (x, y) in face.landmarks.astype(int):
-                    cv2.circle(vis, (int(x), int(y)), 2, (0, 255, 0), -1)
-                
                 # Align + embed
                 aligned, _ = aligner.align(frame, face.landmarks)
                 query_emb, _ = embedder.embed(aligned)
@@ -180,29 +213,55 @@ def main():
                     # When locked, mark the locked person so you can still see who else is recognized
                     if lock_name and best_match_name == lock_name:
                         display_name = f"{name} (locked)"
+                        is_locked_person = True
                     else:
                         display_name = name
+                        is_locked_person = False
                 else:
                     name = "Unknown"
                     display_name = "Unknown"
                     confidence = 0
                     color = (0, 0, 255)
+                    is_locked_person = False
                 
-                # Draw label
-                cv2.putText(
-                    vis, f"{display_name} ({best_dist:.3f})", (face.x1, max(0, face.y1 - 10)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2
-                )
-                
-                # Draw confidence bar
-                bar_w = 100
-                bar_h = 20
-                bar_x = face.x1
-                bar_y = face.y1 - 35
-                cv2.rectangle(vis, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), (200, 200, 200), 1)
-                if accepted:
-                    filled_w = int(bar_w * confidence)
-                    cv2.rectangle(vis, (bar_x, bar_y), (bar_x + filled_w, bar_y + bar_h), color, -1)
+                # Draw based on lock status
+                if is_locked_person:
+                    # For locked person: show bounding box, landmarks, and full details
+                    # Draw bounding box
+                    cv2.rectangle(vis, (face.x1, face.y1), (face.x2, face.y2), color, 2)
+                    
+                    # Draw landmarks as small squares
+                    for (x, y) in face.landmarks.astype(int):
+                        cv2.rectangle(vis, (int(x) - 3, int(y) - 3), (int(x) + 3, int(y) + 3), color, 1)
+                    
+                    # Draw label with distance
+                    cv2.putText(
+                        vis, f"{display_name} ({best_dist:.3f})", (face.x1, max(0, face.y1 - 10)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2
+                    )
+                    
+                    # Draw confidence bar
+                    bar_w = 100
+                    bar_h = 20
+                    bar_x = face.x1
+                    bar_y = face.y1 - 35
+                    cv2.rectangle(vis, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), (200, 200, 200), 1)
+                    if accepted:
+                        filled_w = int(bar_w * confidence)
+                        cv2.rectangle(vis, (bar_x, bar_y), (bar_x + filled_w, bar_y + bar_h), color, -1)
+                elif accepted:
+                    # For recognized but unlocked: only show name text, NO rectangle/box
+                    cv2.putText(
+                        vis, display_name, (face.x1, max(0, face.y1 - 10)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2
+                    )
+                else:
+                    # For unknown: show red text and optionally a red box
+                    cv2.rectangle(vis, (face.x1, face.y1), (face.x2, face.y2), color, 2)
+                    cv2.putText(
+                        vis, display_name, (face.x1, max(0, face.y1 - 10)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2
+                    )
             
             # Header (show lock status)
             lock_status = f"Lock: {lock_name}" if lock_name else "Lock: (none)"
@@ -223,11 +282,11 @@ def main():
             
             # Controls hint
             cv2.putText(
-                vis, "q=quit r=reload l=clear lock +/-=threshold", (10, vis.shape[0] - 10),
+                vis, "q=quit r=reload l=clear lock f=fullscreen +/-=threshold", (10, vis.shape[0] - 10),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1
             )
             
-            cv2.imshow("Live Recognition", vis)
+            cv2.imshow(window_name, vis)
             
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q"):
@@ -243,6 +302,14 @@ def main():
             elif key == ord("l"):
                 lock_name = None
                 print("Lock cleared – no one highlighted as locked")
+            elif key == ord("f"):
+                is_fullscreen = not is_fullscreen
+                if is_fullscreen:
+                    cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+                    print("Fullscreen: ON")
+                else:
+                    cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_NORMAL)
+                    print("Fullscreen: OFF")
             elif key in (ord("+"), ord("=")):
                 threshold = min(1.0, threshold + 0.01)
                 print(f"Threshold: {threshold:.2f}")
@@ -259,5 +326,15 @@ def main():
 
 
 if __name__ == "__main__":
-    success = main()
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Live face recognition with multi-person support")
+    parser.add_argument(
+        "--fullscreen", "-f",
+        action="store_true",
+        help="Start in fullscreen mode"
+    )
+    args = parser.parse_args()
+    
+    success = main(start_fullscreen=args.fullscreen)
     sys.exit(0 if success else 1)

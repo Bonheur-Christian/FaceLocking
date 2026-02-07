@@ -1,9 +1,12 @@
 {
-  "timestamp": "2026-02-06 10:58:04",
+  "timestamp": "2026-02-06 15:47:07",
   "embedding_dim": 512,
   "names": [
     "Bonheur",
+    "ashraf",
+    "bedo",
+    "calvin",
     "laurent"
   ],
-  "samples_used": 21
+  "samples_used": 17
 }
