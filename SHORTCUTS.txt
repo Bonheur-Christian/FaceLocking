@@ -1,0 +1,74 @@
+╔═══════════════════════════════════════════════════════════════════════════╗
+║                         QUICK COMMAND SHORTCUTS                           ║
+╚═══════════════════════════════════════════════════════════════════════════╝
+
+Your broker IP (157.173.101.159) is now saved in src/config.py!
+
+You can now use these SHORT commands:
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                            MAIN COMMANDS                                    │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+  python track.py              Run face tracking (uses saved broker IP)
+  
+  ./track.sh                   Even shorter! (Linux/macOS)
+  
+  python -m src.enroll         Enroll new face
+
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                            WITH OPTIONS                                     │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+  python track.py -f           Start in fullscreen
+  
+  python track.py --no-mqtt    Run without MQTT (just recognition)
+
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                            TESTING                                          │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+  python test_mqtt_system.py        Test complete system
+  
+  python test_simple_tracking.py    Test servo only
+  
+  python debug_mqtt_tracking.py     Monitor MQTT messages
+
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         CHANGE BROKER IP                                    │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+  Edit src/config.py and change:
+  
+    MQTT_BROKER_HOST = "YOUR_NEW_IP"
+
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         KEYBOARD CONTROLS                                   │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+  While tracking is running:
+  
+    q  = Quit
+    s  = Toggle search mode
+    c  = Center camera
+    l  = Clear lock
+    f  = Fullscreen
+    +  = Increase threshold
+    -  = Decrease threshold
+
+
+═══════════════════════════════════════════════════════════════════════════
+
+BEFORE (Long):
+  python -m src.recognize_with_tracking --broker 157.173.101.159 --port 1883
+
+AFTER (Short):
+  python track.py
+
+═══════════════════════════════════════════════════════════════════════════
+
+For more details, see: QUICK_COMMANDS.md

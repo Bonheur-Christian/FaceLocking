@@ -1,0 +1,16 @@
+{
+  "person_name": "Bonheur",
+  "session_start": "2026-02-26T20:38:34.385027",
+  "session_end": "2026-02-26T20:39:05.855021",
+  "session_duration_seconds": 31.47,
+  "activity_counts": {
+    "blink": 0,
+    "smile": 0,
+    "move_left": 1,
+    "move_right": 1,
+    "move_up": 1,
+    "move_down": 1
+  },
+  "total_activities": 4,
+  "csv_log": "/home/bonheur/Documents/Programming/Studying/Intelligent-Robotics/testing/data/history/Bonheur_20260226_203834_activities.csv"
+}

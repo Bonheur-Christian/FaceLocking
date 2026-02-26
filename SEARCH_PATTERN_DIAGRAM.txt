@@ -1,0 +1,241 @@
+╔═══════════════════════════════════════════════════════════════════════════╗
+║                    FULL 180° SEARCH PATTERN DIAGRAM                       ║
+╚═══════════════════════════════════════════════════════════════════════════╝
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          TOP VIEW (Bird's Eye)                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+                              Camera View
+                                   ↓
+                                   
+    0°                    90°                    180°
+    ↓                      ↓                      ↓
+    
+    ◄──────────────────────┼──────────────────────►
+    Far Left            Center              Far Right
+    
+    
+    Position 1:  0°   ←  Start here (Far Left)
+    Position 2:  30°  ←  
+    Position 3:  60°  ←  
+    Position 4:  90°  ←  Center
+    Position 5:  120° ←  
+    Position 6:  150° ←  
+    Position 7:  180° ←  Far Right (Turn around point)
+    Position 8:  150° →  
+    Position 9:  120° →  
+    Position 10: 90°  →  Center again
+    Position 11: 60°  →  
+    Position 12: 30°  →  
+    Position 13: 0°   →  Back to start (Repeat)
+
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        SWEEP MOTION VISUALIZATION                           │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+Time: 0s     2s    4s    6s    8s    10s   12s   14s   16s   18s   20s   22s
+      ↓      ↓     ↓     ↓     ↓     ↓     ↓     ↓     ↓     ↓     ↓     ↓
+Angle: 0° → 30° → 60° → 90° → 120° → 150° → 180° → 150° → 120° → 90° → 60° → 30° → 0°
+
+      ◄────────────────────────────────────────────────────────────────────────►
+                    One complete sweep cycle = 24 seconds
+
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         CAMERA FIELD OF VIEW                                │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+Position 1 (0°):                Position 7 (180°):
+    ┌─────┐                         ┌─────┐
+    │ ◄── │ Far Left                │ ──► │ Far Right
+    └─────┘                         └─────┘
+    
+Position 4 (90°):
+    ┌─────┐
+    │  ↑  │ Center
+    └─────┘
+
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      SEARCH COVERAGE AREA                                   │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+                    Room Layout (Top View)
+                    
+    Wall ═══════════════════════════════════════════════ Wall
+         ║                                             ║
+         ║    0°        90°        180°                ║
+         ║     ↓         ↓          ↓                  ║
+         ║     ╲         |          ╱                  ║
+         ║      ╲        |         ╱                   ║
+         ║       ╲       |        ╱                    ║
+         ║        ╲      |       ╱                     ║
+         ║         ╲     |      ╱                      ║
+         ║          ╲    |     ╱                       ║
+         ║           ╲   |    ╱                        ║
+         ║            ╲  |   ╱                         ║
+         ║             ╲ |  ╱                          ║
+         ║              ╲| ╱                           ║
+         ║               📷  ← Camera + Servo          ║
+         ║                                             ║
+    Wall ═══════════════════════════════════════════════ Wall
+    
+    Coverage: Full 180° horizontal sweep
+    Blind spot: Behind camera (180° to 360°)
+
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        SEARCH BEHAVIOR FLOWCHART                            │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+    ┌─────────────────┐
+    │ Person Detected │
+    │   (Tracking)    │
+    └────────┬────────┘
+             │
+             ▼
+    ┌─────────────────┐
+    │  Person Lost?   │
+    └────────┬────────┘
+             │ Yes
+             ▼
+    ┌─────────────────┐
+    │ Wait 3 seconds  │
+    │  (30 frames)    │
+    └────────┬────────┘
+             │
+             ▼
+    ┌─────────────────┐
+    │ Start Search    │
+    │ Mode: Position 1│
+    └────────┬────────┘
+             │
+             ▼
+    ┌─────────────────┐
+    │ Move to 0°      │◄─────────────┐
+    └────────┬────────┘              │
+             │                        │
+             ▼                        │
+    ┌─────────────────┐              │
+    │ Wait 2 seconds  │              │
+    └────────┬────────┘              │
+             │                        │
+             ▼                        │
+    ┌─────────────────┐              │
+    │ Person Found?   │              │
+    └────────┬────────┘              │
+             │ No                     │
+             ▼                        │
+    ┌─────────────────┐              │
+    │ Next Position   │              │
+    │ (30°, 60°, etc.)│              │
+    └────────┬────────┘              │
+             │                        │
+             └────────────────────────┘
+             
+             │ Yes (Person Found)
+             ▼
+    ┌─────────────────┐
+    │  Stop Search    │
+    │ Resume Tracking │
+    └─────────────────┘
+
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         TIMING BREAKDOWN                                    │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+Event                           Time        Cumulative
+─────────────────────────────────────────────────────────
+Person lost                     0s          0s
+Wait before search starts       3s          3s
+Move to position 1 (0°)         0.5s        3.5s
+Hold at 0°                      2s          5.5s
+Move to position 2 (30°)        0.5s        6s
+Hold at 30°                     2s          8s
+Move to position 3 (60°)        0.5s        8.5s
+Hold at 60°                     2s          10.5s
+Move to position 4 (90°)        0.5s        11s
+Hold at 90°                     2s          13s
+Move to position 5 (120°)       0.5s        13.5s
+Hold at 120°                    2s          15.5s
+Move to position 6 (150°)       0.5s        16s
+Hold at 150°                    2s          18s
+Move to position 7 (180°)       0.5s        18.5s
+Hold at 180°                    2s          20.5s
+... (continues back to 0°)      ...         ...
+
+Total for one complete cycle:   ~27 seconds
+
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      CONFIGURATION OPTIONS                                  │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+1. FASTER SEARCH (Fewer positions):
+   sweep_positions = [0, 45, 90, 135, 180, 90]
+   Time per cycle: ~12 seconds
+
+2. SLOWER SEARCH (More positions):
+   sweep_positions = [0, 15, 30, 45, 60, 75, 90, 105, 120, 135, 150, 165, 180, ...]
+   Time per cycle: ~48 seconds
+
+3. QUICK SCAN (3 positions):
+   sweep_positions = [0, 90, 180, 90]
+   Time per cycle: ~8 seconds
+
+4. CENTER-FOCUSED (Limited range):
+   sweep_positions = [60, 75, 90, 105, 120, 105, 90, 75]
+   Time per cycle: ~16 seconds
+
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         VISUAL INDICATORS                                   │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+On Screen:
+    ┌────────────────────────────────────────────────┐
+    │ Lock: Alice | 📡 MQTT: ON | FPS: 9.2          │
+    │                                                 │
+    │ 🔍 SEARCHING... (45 frames)                    │
+    │                                                 │
+    │                                                 │
+    │                                                 │
+    │                                                 │
+    │                                                 │
+    │                                                 │
+    │                                                 │
+    │ Servo: 60°                                     │
+    │ q=quit s=search c=center                       │
+    └────────────────────────────────────────────────┘
+
+Terminal Output:
+    🔍 Person lost - starting search mode
+    🔄 Searching... moving to 0°
+    🔄 Searching... moving to 30°
+    🔄 Searching... moving to 60°
+    🔄 Searching... moving to 90°
+    ✓ Person found - stopping search
+
+Arduino Serial Monitor:
+    📨 Received [camera/track/horizontal]: 0
+    → Moving to: 0
+    ✓ Reached target position: 0
+    📨 Received [camera/track/horizontal]: 30
+    → Moving to: 30
+    ✓ Reached target position: 30
+
+
+═══════════════════════════════════════════════════════════════════════════
+
+SUMMARY:
+- 12 positions covering full 180°
+- 2 seconds at each position
+- ~24 seconds for complete cycle
+- Automatic start after 3 seconds
+- Manual trigger with 's' key
+- Stops when person found
+
+═══════════════════════════════════════════════════════════════════════════

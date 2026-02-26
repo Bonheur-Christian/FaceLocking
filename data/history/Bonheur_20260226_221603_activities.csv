@@ -1,0 +1,6 @@
+timestamp,frame_number,activity_type,face_center_x,face_center_y,details
+2026-02-26T22:16:10.224152,15,move_left,329.5,351.5,dx=-23.5px
+2026-02-26T22:16:11.766748,20,move_left,316.5,347.5,dx=-29.5px
+2026-02-26T22:16:12.959659,24,move_right,341.0,353.5,dx=21.0px
+2026-02-26T22:16:20.317023,43,blink,334.5,354.0,
+2026-02-26T22:16:22.501571,49,move_right,350.5,349.0,dx=17.5px
