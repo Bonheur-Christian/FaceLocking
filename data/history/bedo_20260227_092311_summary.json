@@ -1,0 +1,16 @@
+{
+  "person_name": "bedo",
+  "session_start": "2026-02-27T09:23:11.875038",
+  "session_end": "2026-02-27T09:27:33.720843",
+  "session_duration_seconds": 261.85,
+  "activity_counts": {
+    "blink": 0,
+    "smile": 0,
+    "move_left": 0,
+    "move_right": 0,
+    "move_up": 0,
+    "move_down": 0
+  },
+  "total_activities": 0,
+  "csv_log": "/home/bonheur/Documents/Programming/Studying/Intelligent-Robotics/FaceLocking/data/history/bedo_20260227_092311_activities.csv"
+}

@@ -111,7 +111,7 @@ ACCEPT_HOLD_FRAMES = 3  # Hold "accepted" state for N frames
 # CAMERA SETTINGS
 # ============================================================================
 
-CAMERA_INDEX = 0 # Default: first camera
+CAMERA_INDEX = 2 # Default: first camera
 CAMERA_FRAME_WIDTH = 640
 CAMERA_FRAME_HEIGHT = 480
 CAMERA_FPS_TARGET = 30
@@ -163,6 +163,16 @@ MQTT_PASSWORD = None  # Optional: Set if broker requires authentication
 MQTT_TOPIC_HORIZONTAL = "camera/track/horizontal"
 MQTT_TOPIC_COMMAND = "camera/track/command"
 MQTT_TOPIC_STATUS = "camera/status"
+
+# Camera Tracking Behavior
+ENABLE_AUTO_CENTERING = True  # Automatically center and lock on person
+CENTERING_TOLERANCE = 0.1  # 10% of frame width (center zone size)
+FRAMES_TO_LOCK_CENTER = 15  # Frames person must stay centered before locking
+TRACKING_MOVEMENT_THRESHOLD = 0.05  # 5% of frame width to trigger movement
+
+# Movement-Based Tracking (Only move camera when person actually moves)
+MOVEMENT_BASED_TRACKING = True  # Only track on detected movements, not continuous
+MOVEMENT_SENSITIVITY = 20  # Pixels - lower = more sensitive (default was 15)
 
 # ============================================================================
 # DEBUG & LOGGING

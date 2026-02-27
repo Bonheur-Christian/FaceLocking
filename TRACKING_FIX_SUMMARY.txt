@@ -1,0 +1,142 @@
+╔═══════════════════════════════════════════════════════════════════════════╗
+║                    TRACKING BEHAVIOR - FIXED!                             ║
+╚═══════════════════════════════════════════════════════════════════════════╝
+
+Camera now STOPS immediately when person is found and ONLY moves when they
+actually move left or right!
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          WHAT WAS FIXED                                     │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+  ❌ OLD BEHAVIOR (Continuous Tracking):
+     - Camera constantly adjusts every frame
+     - Sends 10 MQTT messages per second
+     - Creates feedback loop
+     - Pushes person out of frame
+     - Never stops moving
+     
+  ✅ NEW BEHAVIOR (Movement-Based):
+     - Camera STOPS when person found
+     - Only moves when person moves >20 pixels
+     - Sends 1-2 messages per second
+     - Person stays in frame
+     - Stable, professional view
+
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          HOW IT WORKS NOW                                   │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+  1. 🔍 SEARCH      → Camera sweeps 0° to 180°
+  
+  2. ✓ FOUND        → Camera STOPS immediately
+  
+  3. ⏸️ WAIT         → Camera stays still, monitors person
+  
+  4. ⬅️ MOVE LEFT   → Person moves >20px left
+                     → Camera adjusts left
+                     → Camera STOPS again
+  
+  5. ➡️ MOVE RIGHT  → Person moves >20px right
+                     → Camera adjusts right
+                     → Camera STOPS again
+  
+  6. 🎯 CENTERED    → Person in center zone
+                     → Camera LOCKS
+                     → No movement at all
+
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          CONFIGURATION                                      │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+  Edit src/activity_logger.py:
+  
+  # Movement threshold (pixels)
+  self.movement_threshold_x = 20  # Default
+  
+  # Cooldown (frames between movements)
+  self.movement_cooldown = 8      # Default
+
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          ADJUSTMENTS                                        │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+  More Sensitive (responds to smaller movements):
+    self.movement_threshold_x = 15
+    self.movement_cooldown = 5
+    
+  More Stable (less jitter, more stable):
+    self.movement_threshold_x = 30
+    self.movement_cooldown = 12
+    
+  Balanced (default):
+    self.movement_threshold_x = 20
+    self.movement_cooldown = 8
+
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          WHAT YOU'LL SEE                                    │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+  Terminal:
+    ✓ Person found - stopping search
+    🎯 Centering on person...
+    ⬅️  DETECTED: Move LEFT (dx=-25.3px)
+    📤 Sending MQTT command for: move_left
+    🎯 Person CENTERED and LOCKED!
+       Holding position - person is in center zone
+    
+  On Screen:
+    Move Left!  (when movement detected)
+    🎯 CENTERED & LOCKED (15 frames)
+    [Green center zone rectangle]
+
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          BENEFITS                                           │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+  ✅ Camera stops when person is still
+  ✅ No more pushing person out of frame
+  ✅ Stable, professional video
+  ✅ 80-90% fewer MQTT messages
+  ✅ Less servo wear and power usage
+  ✅ Responsive to actual movement
+  ✅ Clean, smooth tracking
+
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          EXAMPLE TIMELINE                                   │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+  0s:  Person lost → 🔍 Searching...
+  4s:  Person found at 45° → ✓ Found! Camera STOPS
+  5s:  Person still → ⏸️ Camera still
+  6s:  Person still → ⏸️ Camera still
+  7s:  Person moves left 25px → ⬅️ Camera adjusts left
+  8s:  Person still → ⏸️ Camera STOPS
+  9s:  Person still → ⏸️ Camera still
+  10s: Person in center → 🎯 CENTERED & LOCKED
+  15s: Person still → ⏸️ Camera locked, no movement
+  20s: Person moves right 30px → ➡️ Camera adjusts right
+  21s: Person still → ⏸️ Camera STOPS
+  22s: Person centered again → 🎯 LOCKED
+
+
+═══════════════════════════════════════════════════════════════════════════
+
+KEY CHANGES:
+
+  1. Removed continuous position tracking (track_face_position)
+  2. Only use movement detection (track_face_movement)
+  3. Increased movement threshold: 15px → 20px
+  4. Increased cooldown: 5 frames → 8 frames
+  5. Camera stops immediately when person found
+  6. Camera only moves on detected left/right movement
+
+═══════════════════════════════════════════════════════════════════════════
+
+For detailed documentation, see: MOVEMENT_BASED_TRACKING.md

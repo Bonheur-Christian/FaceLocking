@@ -187,13 +187,20 @@ def main(
     tracking_smoothing = []  # Smooth tracking over multiple frames
     TRACKING_SMOOTH_WINDOW = 5
     
+    # Centering state
+    person_centered = False
+    centering_tolerance = frame_width * config.CENTERING_TOLERANCE  # From config
+    frames_centered = 0
+    FRAMES_TO_LOCK_CENTER = config.FRAMES_TO_LOCK_CENTER  # From config
+    
     # Search mode state (when person not found)
     search_mode = False
     frames_without_person = 0
-    FRAMES_BEFORE_SEARCH = 30  # Start searching after 30 frames (~3 seconds at 10 FPS)
+    FRAMES_BEFORE_SEARCH = 20  # Start searching after 20 frames (~2 seconds at 10 FPS)
     last_search_time = 0
     SEARCH_INTERVAL = 2.0  # Move to next position every 2 seconds
-    current_search_angle = 90
+    sweep_positions = [0, 30, 60, 90, 120, 150, 180, 150, 120, 90, 60, 30]  # Full sweep pattern
+    search_sweep_index = 0  # Index in sweep pattern
     
     # Fullscreen state
     is_fullscreen = start_fullscreen
@@ -287,32 +294,37 @@ def main(
                         for movement in movements:
                             action_display.append((movement.replace("_", " ").title() + "!", ACTION_DISPLAY_DURATION))
                             
-                            # Send MQTT command for camera tracking
-                            print(f"🎯 Movement detected: {movement}")
-                            if mqtt_controller:
-                                print(f"   MQTT controller exists: {mqtt_controller.is_connected}")
-                                if mqtt_controller.is_connected:
-                                    mqtt_controller.track_face_movement(movement)
-                                else:
-                                    print("   ⚠️  MQTT controller NOT connected!")
-                            else:
-                                print("   ⚠️  MQTT controller is None!")
+                            # Send MQTT command for camera tracking (ONLY on detected movement)
+                            if mqtt_controller and mqtt_controller.is_connected:
+                                mqtt_controller.track_face_movement(movement)
                     
                     # Update camera position based on face location
+                    # ONLY track based on detected movements (left/right), NOT continuous position
+                    # This prevents constant camera adjustments that push person out of frame
                     if mqtt_controller and mqtt_controller.is_connected:
                         face_center_x = (face.x1 + face.x2) / 2
+                        frame_center_x = frame_width / 2
                         
-                        # Smooth tracking
-                        tracking_smoothing.append(face_center_x)
-                        if len(tracking_smoothing) > TRACKING_SMOOTH_WINDOW:
-                            tracking_smoothing.pop(0)
+                        # Calculate distance from center
+                        distance_from_center = abs(face_center_x - frame_center_x)
                         
-                        smoothed_x = sum(tracking_smoothing) / len(tracking_smoothing)
+                        # Check if person is centered
+                        if distance_from_center < centering_tolerance:
+                            frames_centered += 1
+                            if frames_centered >= FRAMES_TO_LOCK_CENTER and not person_centered:
+                                person_centered = True
+                                print("🎯 Person CENTERED and LOCKED!")
+                                print(f"   Holding position - person is in center zone")
+                        else:
+                            # Person moved out of center - reset
+                            if person_centered:
+                                print("⚠️  Person moved - resuming tracking")
+                                person_centered = False
+                            frames_centered = 0
                         
-                        # Only update if significant movement
-                        if last_tracked_x is None or abs(smoothed_x - last_tracked_x) > frame_width * 0.05:
-                            mqtt_controller.track_face_position(smoothed_x, frame_width)
-                            last_tracked_x = smoothed_x
+                        # Camera movement is ONLY triggered by movement detection
+                        # (handled above in activity_logger.detect_and_log_movement)
+                        # NO continuous position tracking to avoid pushing person out of frame
                     
                     # Draw tracking visualization
                     cv2.rectangle(vis, (face.x1, face.y1), (face.x2, face.y2), (0, 255, 255), 3)
@@ -359,24 +371,35 @@ def main(
                     # Person found - reset search mode
                     if search_mode:
                         print("✓ Person found - stopping search")
+                        print("🎯 Centering on person...")
                         search_mode = False
+                        search_sweep_index = 0  # Reset sweep index
+                        person_centered = False  # Reset centering state
+                        frames_centered = 0
                     frames_without_person = 0
                 else:
                     # Person not found - increment counter
                     frames_without_person += 1
+                    person_centered = False  # Reset centering when person lost
+                    frames_centered = 0
                     
                     if frames_without_person >= FRAMES_BEFORE_SEARCH:
                         if not search_mode:
                             print("🔍 Person lost - starting search mode")
+                            print("📍 Starting full sweep from 0° to 180°...")
                             search_mode = True
+                            search_sweep_index = 0
+                            # Move to first position
+                            mqtt_controller.move_to_angle(sweep_positions[search_sweep_index])
+                            print(f"→ Camera angle: {sweep_positions[search_sweep_index]}°")
                             last_search_time = time.time()
                         
                         # Perform sweep at intervals
                         current_time = time.time()
                         if current_time - last_search_time >= SEARCH_INTERVAL:
-                            current_search_angle = mqtt_controller.search_sweep(current_search_angle)
+                            next_angle, search_sweep_index = mqtt_controller.search_sweep(search_sweep_index)
                             last_search_time = current_time
-                            print(f"🔄 Searching... moving to {current_search_angle}°")
+                            print(f"🔄 Searching... moving to {next_angle}°")
             
             # Display search mode indicator
             if search_mode:
@@ -384,6 +407,30 @@ def main(
                 cv2.putText(
                     vis, search_text, (10, vis.shape[0] - 170),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2
+                )
+            
+            # Display centered indicator
+            if person_centered and locked_person_found:
+                centered_text = f"🎯 CENTERED & LOCKED ({frames_centered} frames)"
+                cv2.putText(
+                    vis, centered_text, (10, vis.shape[0] - 200),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2
+                )
+                # Draw center zone indicator
+                center_x = int(frame_width / 2)
+                zone_width = int(centering_tolerance)
+                cv2.rectangle(vis, 
+                             (center_x - zone_width, 0), 
+                             (center_x + zone_width, vis.shape[0]), 
+                             (0, 255, 0), 2)
+                cv2.putText(vis, "CENTER ZONE", (center_x - 60, 60),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            elif locked_person_found and not person_centered:
+                # Show centering progress
+                centering_text = f"⏳ Centering... ({frames_centered}/{FRAMES_TO_LOCK_CENTER})"
+                cv2.putText(
+                    vis, centering_text, (10, vis.shape[0] - 200),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2
                 )
             
             # Header
@@ -477,6 +524,10 @@ def main(
                     search_mode = not search_mode
                     if search_mode:
                         print("🔍 Search mode: ON (manual)")
+                        print("📍 Moving to start position (0°)...")
+                        # Start search from 0° (far left)
+                        mqtt_controller.move_to_angle(0)
+                        current_search_angle = 0
                         frames_without_person = FRAMES_BEFORE_SEARCH
                         last_search_time = time.time()
                     else:

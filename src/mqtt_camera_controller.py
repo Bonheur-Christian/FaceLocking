@@ -160,38 +160,26 @@ class MQTTCameraController:
             print(f"✗ Failed to send center command: {e}")
             return False
     
-    def search_sweep(self, current_angle: int = None) -> int:
+    def search_sweep(self, sweep_index: int = 0) -> tuple:
         """
         Perform search sweep pattern across full 180 degrees.
-        Returns next angle to move to.
+        Returns next angle and updated index.
         
         Args:
-            current_angle: Current servo angle (None = use stored angle)
+            sweep_index: Current index in sweep pattern (0-11)
             
         Returns:
-            Next angle for sweep pattern
+            Tuple of (next_angle, next_index)
         """
-        if current_angle is None:
-            current_angle = self.current_angle
-        
-        # Full 180-degree sweep pattern: 0 -> 30 -> 60 -> 90 -> 120 -> 150 -> 180 -> 150 -> 120 -> 90 -> 60 -> 30 -> 0
+        # Full 180-degree sweep pattern: 0 -> 30 -> 60 -> 90 -> 120 -> 150 -> 180 -> 150 -> 120 -> 90 -> 60 -> 30 -> (repeat)
         sweep_positions = [0, 30, 60, 90, 120, 150, 180, 150, 120, 90, 60, 30]
         
-        # Find closest position in sweep pattern
-        closest_idx = 0
-        min_diff = abs(sweep_positions[0] - current_angle)
-        for i, pos in enumerate(sweep_positions):
-            diff = abs(pos - current_angle)
-            if diff < min_diff:
-                min_diff = diff
-                closest_idx = i
-        
-        # Move to next position in pattern
-        next_idx = (closest_idx + 1) % len(sweep_positions)
+        # Get next position
+        next_idx = (sweep_index + 1) % len(sweep_positions)
         next_angle = sweep_positions[next_idx]
         
         self.move_to_angle(next_angle)
-        return next_angle
+        return next_angle, next_idx
     
     def track_face_position(self, face_center_x: float, frame_width: int) -> bool:
         """

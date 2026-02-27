@@ -1,0 +1,16 @@
+{
+  "person_name": "angella",
+  "session_start": "2026-02-27T09:53:42.856907",
+  "session_end": "2026-02-27T09:56:51.224647",
+  "session_duration_seconds": 188.37,
+  "activity_counts": {
+    "blink": 0,
+    "smile": 13,
+    "move_left": 16,
+    "move_right": 16,
+    "move_up": 2,
+    "move_down": 1
+  },
+  "total_activities": 48,
+  "csv_log": "/home/bonheur/Documents/Programming/Studying/Intelligent-Robotics/FaceLocking/data/history/angella_20260227_095342_activities.csv"
+}

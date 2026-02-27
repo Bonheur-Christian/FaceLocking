@@ -29,8 +29,8 @@
 // ============================================================================
 
 // WiFi credentials
-const char* ssid = "RCA-OUTDOOR";
-const char* password = "RCA@2025";
+const char* ssid = "RCA-A";
+const char* password = "RCA@2024";
 
 // MQTT Broker settings
 const char* mqtt_server = "157.173.101.159";  // Your MQTT broker IP
@@ -47,7 +47,7 @@ const char* topic_status = "camera/status";
 const int SERVO_PIN = 2;  // GPIO2
 const int SERVO_MIN_ANGLE = 0;
 const int SERVO_MAX_ANGLE = 180;
-const int SERVO_CENTER_ANGLE = 90;
+const int SERVO_CENTER_ANGLE = 0;
 const int SERVO_STEP_SIZE = 10;  // Degrees per movement command
 
 // Movement smoothing

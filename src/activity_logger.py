@@ -51,9 +51,9 @@ class ActivityLogger:
         
         # Movement tracking
         self.previous_face_center: Optional[Tuple[float, float]] = None
-        self.movement_threshold_x = 15  # pixels (REDUCED from 30 for more sensitivity)
-        self.movement_threshold_y = 15  # pixels (REDUCED from 30 for more sensitivity)
-        self.movement_cooldown = 5  # frames between movement detections (REDUCED from 10)
+        self.movement_threshold_x = 20  # pixels (INCREASED for less jitter)
+        self.movement_threshold_y = 20  # pixels (INCREASED for less jitter)
+        self.movement_cooldown = 8  # frames between movement detections (INCREASED to reduce noise)
         self.last_movement_frame: Dict[str, int] = {}
         
         # Session start time
@@ -121,10 +121,6 @@ class ActivityLogger:
         
         dx = curr_x - prev_x
         dy = curr_y - prev_y
-        
-        # DEBUG: Print movement detection
-        if abs(dx) > 5 or abs(dy) > 5:  # Show any significant movement
-            print(f"🔍 Movement: dx={dx:.1f}px, dy={dy:.1f}px (threshold={self.movement_threshold_x}px)")
         
         # Detect horizontal movement
         if abs(dx) > self.movement_threshold_x:
