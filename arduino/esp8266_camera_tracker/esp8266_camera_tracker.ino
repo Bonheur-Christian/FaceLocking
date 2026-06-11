@@ -45,8 +45,8 @@ const char* topic_status = "camera/status";
 
 // Servo settings
 const int SERVO_PIN = 2;  // GPIO2
-const int SERVO_MIN_ANGLE = 15;
-const int SERVO_MAX_ANGLE = 165;
+const int SERVO_MIN_ANGLE = 0;
+const int SERVO_MAX_ANGLE = 180;
 const int SERVO_CENTER_ANGLE = 90;
 const int SERVO_STEP_SIZE = 10;  // Degrees per movement command
 

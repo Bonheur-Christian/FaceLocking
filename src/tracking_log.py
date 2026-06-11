@@ -8,9 +8,12 @@ Logs are throttled so the terminal stays readable:
 
 import logging
 import time
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from . import config
+
+if TYPE_CHECKING:
+    from .dashboard_state import DashboardState
 
 _logger = logging.getLogger("facelocking.tracking")
 
@@ -31,8 +34,9 @@ def setup_tracking_logger() -> None:
 class TrackingLogger:
     """State-change and servo-decision logger for the tracking loop."""
 
-    def __init__(self):
+    def __init__(self, dashboard: Optional["DashboardState"] = None):
         setup_tracking_logger()
+        self.dashboard = dashboard
         self._last_state: Optional[str] = None
         self._last_servo_reason: Optional[str] = None
         self._last_status_time = 0.0
@@ -110,10 +114,11 @@ class TrackingLogger:
         now = time.time()
         if key == self._last_servo_reason and (now - self._last_servo_log_time) < config.TRACKING_STATUS_INTERVAL_SEC:
             return
-        _logger.info(
-            "SERVO MOVE: %d° → %d° (%s)",
-            int(from_angle), to_angle, reason,
-        )
+        msg = f"SERVO MOVE: {int(from_angle)}° → {to_angle}° ({reason})"
+        _logger.info(msg)
+        if self.dashboard:
+            self.dashboard.add_servo_event(from_angle, to_angle, reason)
+            self.dashboard.add_log(msg)
         self._last_servo_reason = key
         self._last_servo_log_time = now
 
@@ -122,14 +127,20 @@ class TrackingLogger:
         now = time.time()
         if key == self._last_servo_reason and (now - self._last_servo_log_time) < config.TRACKING_STATUS_INTERVAL_SEC:
             return
-        _logger.info("SERVO HOLD: %d° (%s)", int(angle), reason)
+        msg = f"SERVO HOLD: {int(angle)}° ({reason})"
+        _logger.info(msg)
+        if self.dashboard:
+            self.dashboard.add_servo_event(angle, angle, reason)
+            self.dashboard.add_log(msg)
         self._last_servo_reason = key
         self._last_servo_log_time = now
 
     def servo_search_step(self, from_angle: float, to_angle: int, step_index: int) -> None:
-        _logger.info(
-            "SERVO SEARCH: %d° → %d° (sweep step %d)",
-            int(from_angle), to_angle, step_index,
-        )
+        reason = f"search step {step_index}"
+        msg = f"SERVO SEARCH: {int(from_angle)}° → {to_angle}° ({reason})"
+        _logger.info(msg)
+        if self.dashboard:
+            self.dashboard.add_servo_event(from_angle, to_angle, reason)
+            self.dashboard.add_log(msg)
         self._last_servo_reason = f"search:{to_angle}"
         self._last_servo_log_time = time.time()

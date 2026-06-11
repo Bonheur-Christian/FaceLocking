@@ -96,7 +96,7 @@ SAVE_ENROLLMENT_CROPS = True
 # RECOGNITION & THRESHOLD SETTINGS
 # ============================================================================
 
-DEFAULT_DISTANCE_THRESHOLD = 0.45  # Cosine distance; lower = stricter / more accurate
+DEFAULT_DISTANCE_THRESHOLD = 0.50  # Cosine distance; lower = stricter / more accurate
 SIMILARITY_THRESHOLD = 0.70  # 1 - distance_threshold (for reference)
 TARGET_FAR = 0.01  # 1% False Accept Rate for threshold tuning
 THRESHOLD_SWEEP_RANGE = (0.10, 1.20, 0.01)  # (start, end, step)
@@ -201,8 +201,8 @@ MQTT_MIN_COMMAND_INTERVAL_MS = 50
 # ----------------------------------------------------------------------------
 # SERVO CONTROL (must match ESP8266 firmware limits)
 # ----------------------------------------------------------------------------
-SERVO_MIN_ANGLE = 15
-SERVO_MAX_ANGLE = 165
+SERVO_MIN_ANGLE = 0    # Full pan range for tracking + search
+SERVO_MAX_ANGLE = 180
 SERVO_CENTER_ANGLE = 90
 # Canonical aliases (Issue #7 "servo:" group)
 MIN_ANGLE = SERVO_MIN_ANGLE
@@ -224,7 +224,7 @@ SERVO_MAX_SPEED = 12     # Max degrees the servo target may change per update (r
 MAX_SPEED = SERVO_MAX_SPEED  # Alias (Issue #7)
 SMOOTHING_FACTOR = 0.5   # EMA factor for the measured error (0=frozen, 1=no smoothing)
 SERVO_STEP_SIZE = 5      # Manual nudge step (left/right keys, command mode)
-SERVO_MAX_PAN_OFFSET = 45  # Legacy absolute-mapping cap (unused by PID path)
+SERVO_MAX_PAN_OFFSET = 75  # Max degrees from center when tracking (wider follow range)
 
 # Dead zone: ignore tiny face offsets so the servo stays still when centered.
 CENTER_DEAD_ZONE = 25  # Pixels of half-width tolerance around frame center
@@ -247,16 +247,24 @@ TRACKING_MOVEMENT_THRESHOLD = 0.05
 # ----------------------------------------------------------------------------
 LOST_TARGET_TIMEOUT = 0.8        # Seconds target may be missing before SEARCH_MODE
 LOST_TARGET_FRAMES = 8           # Frames a track may be missing before it is dropped
-SEARCH_SWEEP_SPEED = 90.0        # Degrees per second the sweep waypoint advances
-SEARCH_SWEEP_STEP = 12           # Degrees between successive sweep waypoints
+
+# Search sweep — full 0°–180° coverage (wider than old 15°–165° range)
+SEARCH_MIN_ANGLE = 0
+SEARCH_MAX_ANGLE = 180
+SEARCH_SWEEP_SPEED = 100.0       # Degrees per second between sweep waypoints
+SEARCH_SWEEP_STEP = 10           # Degrees per step (18 stops across full sweep)
 SEARCH_START_DIRECTION = "last"  # "last" | "left" | "right" — where to look first
 SEARCH_EXPAND_ENABLED = True     # Expand outward from last-known angle before full sweep
 SEARCH_REACQUIRE_FRAMES = 2      # Frames the original target must be re-seen to re-lock
+SEARCH_ENDPOINT_DWELL_SEC = 0.4  # Pause at each sweep edge for camera to settle
 
 # Legacy fixed sweep (used only if SEARCH_EXPAND_ENABLED is False)
 FRAMES_BEFORE_SEARCH = 24
 SEARCH_INTERVAL_SEC = 0.15
-SEARCH_SWEEP_POSITIONS = [15, 30, 60, 90, 120, 150, 165, 150, 120, 90, 60, 30, 15]
+SEARCH_SWEEP_POSITIONS = [
+    0, 15, 30, 45, 60, 75, 90, 105, 120, 135, 150, 165, 180,
+    165, 150, 135, 120, 105, 90, 75, 60, 45, 30, 15, 0,
+]
 
 # ----------------------------------------------------------------------------
 # BOUNDING-BOX COLORS (BGR) — Issue #2
@@ -276,6 +284,17 @@ VERBOSE_LOGGING = False
 TRACKING_LOG_ENABLED = True  # Console logs for lock visibility and servo decisions
 TRACKING_STATUS_INTERVAL_SEC = 2.0  # Min seconds between repeated hold/missing messages
 SAVE_DEBUG_FRAMES = False
+
+# ============================================================================
+# WEB DASHBOARD
+# ============================================================================
+
+DASHBOARD_ENABLED = False
+DASHBOARD_HOST = "127.0.0.1"  # Use 0.0.0.0 to view from other devices on LAN
+DASHBOARD_PORT = 8765
+DASHBOARD_STREAM_FPS = 12  # MJPEG stream rate (lower = less CPU)
+DASHBOARD_SERVO_HISTORY = 40
+DASHBOARD_HEADLESS = False  # True = no OpenCV window, browser only
 
 # ============================================================================
 # QUALITY CHECKS

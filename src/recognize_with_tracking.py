@@ -44,6 +44,8 @@ from .recognition_core import (
 from .tracking import PanTracker
 from .tracking_log import TrackingLogger
 from .camera_utils import CameraStream
+from .dashboard_state import DashboardState, faces_from_tracks
+from .dashboard_server import get_state, start_dashboard_server
 
 
 def _draw_debug_overlay(
@@ -110,6 +112,8 @@ def main(
     enable_mqtt: bool = True,
     mqtt_broker: str = None,
     mqtt_port: int = None,
+    enable_dashboard: bool = None,
+    headless: bool = None,
 ) -> bool:
     db = load_database()
     if not db:
@@ -129,6 +133,23 @@ def main(
     if not lock_name:
         print("WARNING: No lock selected. Running recognition only (IDLE).")
 
+    if enable_dashboard is None:
+        enable_dashboard = config.DASHBOARD_ENABLED
+    if headless is None:
+        headless = config.DASHBOARD_HEADLESS and enable_dashboard
+
+    dashboard: Optional[DashboardState] = None
+    if enable_dashboard:
+        try:
+            dashboard = get_state()
+            start_dashboard_server(state=dashboard)
+        except ImportError as exc:
+            print(f"✗ Dashboard disabled: {exc}")
+            enable_dashboard = False
+        except OSError as exc:
+            print(f"✗ Dashboard failed to bind port {config.DASHBOARD_PORT}: {exc}")
+            enable_dashboard = False
+
     mqtt: Optional[MQTTCameraController] = None
     if enable_mqtt:
         mqtt = MQTTCameraController(broker_host=mqtt_broker, broker_port=mqtt_port)
@@ -141,7 +162,7 @@ def main(
             mqtt.center()
             print("✓ MQTT ready — servo centered to start")
     tracker = FaceTracker()
-    tlog = TrackingLogger()
+    tlog = TrackingLogger(dashboard=dashboard)
     pan = PanTracker(mqtt=mqtt, logger=tlog)
 
     activity_logger: Optional[ActivityLogger] = None
@@ -177,12 +198,16 @@ def main(
     camera_warning_frames = 0
 
     window_name = "Face Tracking"
-    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
-    cv2.resizeWindow(window_name, config.DISPLAY_WINDOW_WIDTH, config.DISPLAY_WINDOW_HEIGHT)
-    if start_fullscreen:
-        cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+    show_window = not headless
+    if show_window:
+        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
+        cv2.resizeWindow(window_name, config.DISPLAY_WINDOW_WIDTH, config.DISPLAY_WINDOW_HEIGHT)
+        if start_fullscreen:
+            cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
     print("\nFace Recognition + MQTT Tracking + Search")
+    if enable_dashboard:
+        print(f"Dashboard: http://{config.DASHBOARD_HOST}:{config.DASHBOARD_PORT}")
     print("Controls: q=quit  r=reload  l=unlock  k=lock  s=search  c=center  f=fullscreen  +/-=threshold")
     if config.TRACKING_LOG_ENABLED:
         print("Tracking logs: ON (set TRACKING_LOG_ENABLED=False in config.py to disable)")
@@ -348,13 +373,38 @@ def main(
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2, cv2.LINE_AA)
                 y_action += 18
 
-            cv2.imshow(window_name, vis)
+            if dashboard:
+                dashboard.update_frame(vis)
+                dashboard.update_telemetry(
+                    state=state,
+                    lock_name=lock_name,
+                    servo_angle=float(pan.current_angle),
+                    servo_min=config.SEARCH_MIN_ANGLE,
+                    servo_max=config.SEARCH_MAX_ANGLE,
+                    mqtt_connected=bool(mqtt and mqtt.is_connected),
+                    face_count=len(visible),
+                    track_fps=track_fps,
+                    recog_fps=recog_fps,
+                    threshold=threshold,
+                    lost_for=(time.time() - lost_since) if lost_since else 0.0,
+                    search_manual=pan.search_manual,
+                    faces=faces_from_tracks(visible, tracker.locked_track_id),
+                    enrolled_count=len(names),
+                    frame_idx=frame_idx,
+                )
+
+            if show_window:
+                cv2.imshow(window_name, vis)
 
             # --- Keyboard --------------------------------------------------
-            key = cv2.waitKey(1) & 0xFF
-            if not CameraStream.is_window_open(window_name):
-                print("\nDisplay window closed — exiting.")
-                break
+            if show_window:
+                key = cv2.waitKey(1) & 0xFF
+                if not CameraStream.is_window_open(window_name):
+                    print("\nDisplay window closed — exiting.")
+                    break
+            else:
+                key = 0xFF
+                time.sleep(0.001)
             if key == ord("q"):
                 break
             if key == ord("r"):
@@ -409,7 +459,8 @@ def main(
             mqtt.close()
         detector.close()
         cam.release()
-        cv2.destroyAllWindows()
+        if show_window:
+            cv2.destroyAllWindows()
 
     print("✓ Tracking ended.")
     return True
@@ -423,6 +474,8 @@ if __name__ == "__main__":
     parser.add_argument("--no-mqtt", action="store_true", help="Disable MQTT servo control")
     parser.add_argument("--broker", type=str, default=None, help="MQTT broker IP")
     parser.add_argument("--port", type=int, default=None, help="MQTT broker port")
+    parser.add_argument("--dashboard", "-d", action="store_true", help="Enable web dashboard")
+    parser.add_argument("--headless", action="store_true", help="Dashboard only (no OpenCV window)")
     args = parser.parse_args()
 
     ok = main(
@@ -430,5 +483,7 @@ if __name__ == "__main__":
         enable_mqtt=not args.no_mqtt,
         mqtt_broker=args.broker,
         mqtt_port=args.port,
+        enable_dashboard=args.dashboard,
+        headless=args.headless,
     )
     sys.exit(0 if ok else 1)

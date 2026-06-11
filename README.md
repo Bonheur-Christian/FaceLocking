@@ -11,6 +11,18 @@ python download_model.py
 python -m src.enroll
 python -m src.recognize          # recognition + activity logging
 python track.py                  # recognition + MQTT servo tracking
+python track.py --dashboard      # + web dashboard at http://127.0.0.1:8765
+python track.py -d --headless    # dashboard only (no OpenCV window)
+```
+
+## Web dashboard
+
+Live browser UI with camera feed, servo angle gauge, movement log, face list, and system status.
+
+```bash
+pip install flask   # included in requirements.txt
+python track.py --dashboard
+# Open http://127.0.0.1:8765
 ```
 
 ## MQTT tracking stack

@@ -57,6 +57,8 @@ class PanTracker:
         self._search_waypoints: List[int] = []
         self._search_index = 0
         self._last_search_step_time = 0.0
+        self._last_search_angle: Optional[int] = None
+        self._endpoint_dwell_until = 0.0
 
     # ------------------------------------------------------------------ utils
     def reset(self) -> None:
@@ -68,6 +70,8 @@ class PanTracker:
         self.search_manual = False
         self._search_waypoints = []
         self._search_index = 0
+        self._last_search_angle = None
+        self._endpoint_dwell_until = 0.0
 
     @property
     def current_angle(self) -> float:
@@ -175,8 +179,9 @@ class PanTracker:
 
     # ----------------------------------------------------------------- search
     def _build_search_waypoints(self) -> List[int]:
-        """Direction-aware, expanding sweep starting from the last known angle."""
-        lo, hi = config.SERVO_MIN_ANGLE, config.SERVO_MAX_ANGLE
+        """Direction-aware, expanding sweep across the full search arc (0°–180°)."""
+        lo = config.SEARCH_MIN_ANGLE
+        hi = config.SEARCH_MAX_ANGLE
         step = config.SEARCH_SWEEP_STEP
 
         # Decide initial direction.
@@ -203,13 +208,20 @@ class PanTracker:
                     break
                 amp += step
 
-        # Always finish with a full edge-to-edge sweep so coverage is complete.
+        # Full edge-to-edge sweep: 0 → 180 → 0 (repeat in loop via modulo index).
         sweep = list(range(lo, hi + 1, step))
+        if sweep[-1] != hi:
+            sweep.append(hi)
         if primary < 0:
             sweep = list(reversed(sweep))
         waypoints.extend(sweep)
         waypoints.extend(reversed(sweep))
-        return waypoints
+        # Deduplicate consecutive duplicates while preserving order.
+        deduped: List[int] = []
+        for angle in waypoints:
+            if not deduped or deduped[-1] != angle:
+                deduped.append(angle)
+        return deduped
 
     def search(self) -> Tuple[str, Optional[int]]:
         """
@@ -232,6 +244,11 @@ class PanTracker:
             return ("searching", None)
 
         now = time.time()
+        if now < self._endpoint_dwell_until:
+            if self.log:
+                self.log.servo_hold(self.current_angle, "search dwell at sweep endpoint")
+            return ("searching", None)
+
         step_interval = config.SEARCH_SWEEP_STEP / max(config.SEARCH_SWEEP_SPEED, 1e-3)
         if now - self._last_search_step_time < step_interval:
             if self.log:
@@ -240,6 +257,10 @@ class PanTracker:
 
         from_angle = self.current_angle
         angle = self._search_waypoints[self._search_index % len(self._search_waypoints)]
+        lo, hi = config.SEARCH_MIN_ANGLE, config.SEARCH_MAX_ANGLE
+        if angle in (lo, hi) and angle != self._last_search_angle:
+            self._endpoint_dwell_until = now + config.SEARCH_ENDPOINT_DWELL_SEC
+        self._last_search_angle = angle
         step_num = self._search_index + 1
         self._search_index += 1
         self._last_search_step_time = now
