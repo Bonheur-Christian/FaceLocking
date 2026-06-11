@@ -9,13 +9,8 @@ import numpy as np
 import time
 from pathlib import Path
 
-try:
-    import mediapipe as mp
-except ImportError:
-    print("ERROR: mediapipe not installed. Run: pip install mediapipe")
-    sys.exit(1)
-
 from . import config
+from .face_mesh import FaceMesh
 
 
 class FaceAligner:
@@ -89,7 +84,7 @@ def main():
         print(f"ERROR: Failed to load cascade.")
         return False
     
-    mp_face_mesh = mp.solutions.face_mesh.FaceMesh(
+    mp_face_mesh = FaceMesh(
         static_image_mode=config.FACEMESH_STATIC_MODE,
         max_num_faces=1,
         refine_landmarks=config.FACEMESH_REFINE_LANDMARKS,

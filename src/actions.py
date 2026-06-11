@@ -1,41 +1,16 @@
 """
 Action detection module: smile, blink (and optional face movement).
-Uses MediaPipe Face Mesh for full landmarks. Shared by recognize.py and lock.py.
+Reuses landmarks from the face detector — no second MediaPipe pass.
 """
 
-from typing import List, Optional, Tuple, Dict, Any
-import cv2
+from typing import Any, Dict, List, Optional, Tuple
+
 import numpy as np
 
-try:
-    import mediapipe as mp
-except ImportError:
-    mp = None
-
 from . import config
+from .face_mesh import FaceMesh
 
-
-def get_face_mesh_landmarks(frame: np.ndarray) -> Optional[List[Any]]:
-    """
-    Run MediaPipe Face Mesh on frame; return first face landmark list or None.
-    Caller must have at least one face in frame for meaningful results.
-    """
-    if mp is None:
-        return None
-    H, W = frame.shape[:2]
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    mesh = mp.solutions.face_mesh.FaceMesh(
-        static_image_mode=False,
-        max_num_faces=1,
-        refine_landmarks=True,
-        min_detection_confidence=0.5,
-        min_tracking_confidence=0.5,
-    )
-    results = mesh.process(rgb)
-    mesh.close()
-    if not results.multi_face_landmarks:
-        return None
-    return results.multi_face_landmarks[0].landmark
+_shared_mesh: Optional[FaceMesh] = None
 
 
 def _ear_from_landmarks(landmarks_list: List[Any], indices: Tuple[int, ...], W: int, H: int) -> float:
@@ -80,37 +55,42 @@ def compute_mouth_width(landmarks_list: List[Any], W: int, H: int) -> float:
     )
 
 
-def detect_smile_blink(
-    frame: np.ndarray,
+def get_face_mesh_landmarks(frame) -> Optional[List[Any]]:
+    """Legacy helper for lock.py — prefer passing full_landmarks from the detector."""
+    global _shared_mesh
+    if _shared_mesh is None:
+        _shared_mesh = FaceMesh(max_num_faces=1)
+    import cv2
+
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    results = _shared_mesh.process(rgb)
+    if not results.multi_face_landmarks:
+        return None
+    return results.multi_face_landmarks[0].landmark
+
+
+def detect_smile_blink_from_landmarks(
+    landmarks_list: List[Any],
+    frame_width: int,
+    frame_height: int,
     baseline_mouth_width: Optional[float],
     mouth_width_samples: List[float],
     last_action_frame: Dict[str, int],
     frame_idx: int,
     cooldown_frames: int = 10,
 ) -> Tuple[List[str], Optional[float], List[float]]:
-    """
-    Detect blink and smile from full-face landmarks.
-    Returns:
-        actions: list of "blink" and/or "smile" (empty if none this frame)
-        new_baseline_mouth: updated baseline (median of recent samples) or None
-        new_mouth_samples: updated list of recent mouth widths (caller can pass back next time)
-    """
+    """Detect blink/smile from landmarks already produced by the face detector."""
     actions: List[str] = []
-    H, W = frame.shape[:2]
-    landmarks_list = get_face_mesh_landmarks(frame)
-    if landmarks_list is None:
-        return actions, baseline_mouth_width, mouth_width_samples
+    W, H = frame_width, frame_height
 
     ear = compute_ear(landmarks_list, W, H)
     mouth_width = compute_mouth_width(landmarks_list, W, H)
 
-    # Blink: EAR drops below threshold
     if ear < config.LOCK_EAR_BLINK_THRESHOLD:
         if frame_idx - last_action_frame.get("blink", -999) >= cooldown_frames:
             actions.append("blink")
             last_action_frame["blink"] = frame_idx
 
-    # Smile: mouth width above baseline * ratio (need baseline first)
     mouth_width_samples = list(mouth_width_samples) + [mouth_width]
     if len(mouth_width_samples) > 30:
         mouth_width_samples = mouth_width_samples[-30:]
@@ -123,3 +103,32 @@ def detect_smile_blink(
                 last_action_frame["smile"] = frame_idx
 
     return actions, baseline_mouth_width, mouth_width_samples
+
+
+def detect_smile_blink(
+    frame,
+    baseline_mouth_width: Optional[float],
+    mouth_width_samples: List[float],
+    last_action_frame: Dict[str, int],
+    frame_idx: int,
+    cooldown_frames: int = 10,
+    landmarks_list: Optional[List[Any]] = None,
+) -> Tuple[List[str], Optional[float], List[float]]:
+    """
+    Detect blink and smile. Pass landmarks_list from FaceDetection.full_landmarks
+    to avoid a second MediaPipe inference.
+    """
+    if landmarks_list is None:
+        return [], baseline_mouth_width, mouth_width_samples
+
+    H, W = frame.shape[:2]
+    return detect_smile_blink_from_landmarks(
+        landmarks_list,
+        W,
+        H,
+        baseline_mouth_width,
+        mouth_width_samples,
+        last_action_frame,
+        frame_idx,
+        cooldown_frames,
+    )

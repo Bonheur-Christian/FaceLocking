@@ -29,8 +29,8 @@
 // ============================================================================
 
 // WiFi credentials
-const char* ssid = "RCA-A";
-const char* password = "RCA@2024";
+const char* ssid = "Crux Sacra";
+const char* password = "Nondracositmihidux";
 
 // MQTT Broker settings
 const char* mqtt_server = "157.173.101.159";  // Your MQTT broker IP
@@ -45,9 +45,9 @@ const char* topic_status = "camera/status";
 
 // Servo settings
 const int SERVO_PIN = 2;  // GPIO2
-const int SERVO_MIN_ANGLE = 0;
-const int SERVO_MAX_ANGLE = 180;
-const int SERVO_CENTER_ANGLE = 0;
+const int SERVO_MIN_ANGLE = 15;
+const int SERVO_MAX_ANGLE = 165;
+const int SERVO_CENTER_ANGLE = 90;
 const int SERVO_STEP_SIZE = 10;  // Degrees per movement command
 
 // Movement smoothing
@@ -168,6 +168,46 @@ void reconnect() {
 }
 
 // ============================================================================
+// MESSAGE PARSING — plain text or JSON {"angle":N} / {"command":"left"}
+// ============================================================================
+
+int parseAngleFromMessage(const String& message) {
+  String trimmed = message;
+  trimmed.trim();
+  if (trimmed.startsWith("{")) {
+    int keyPos = trimmed.indexOf("\"angle\"");
+    if (keyPos >= 0) {
+      int colonPos = trimmed.indexOf(':', keyPos);
+      if (colonPos >= 0) {
+        return trimmed.substring(colonPos + 1).toInt();
+      }
+    }
+    return -1;
+  }
+  return trimmed.toInt();
+}
+
+String parseCommandFromMessage(const String& message) {
+  String trimmed = message;
+  trimmed.trim();
+  if (trimmed.startsWith("{")) {
+    int keyPos = trimmed.indexOf("\"command\"");
+    if (keyPos >= 0) {
+      int colonPos = trimmed.indexOf(':', keyPos);
+      if (colonPos >= 0) {
+        int quoteStart = trimmed.indexOf('"', colonPos + 1);
+        int quoteEnd = trimmed.indexOf('"', quoteStart + 1);
+        if (quoteStart >= 0 && quoteEnd > quoteStart) {
+          return trimmed.substring(quoteStart + 1, quoteEnd);
+        }
+      }
+    }
+    return "";
+  }
+  return trimmed;
+}
+
+// ============================================================================
 // MQTT CALLBACK - Handle incoming messages
 // ============================================================================
 
@@ -183,9 +223,9 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
   Serial.print("]: ");
   Serial.println(message);
 
-  // Handle horizontal position (0-180 degrees)
+  // Handle horizontal position (degrees)
   if (strcmp(topic, topic_horizontal) == 0) {
-    int angle = message.toInt();
+    int angle = parseAngleFromMessage(message);
     if (angle >= SERVO_MIN_ANGLE && angle <= SERVO_MAX_ANGLE) {
       targetAngle = angle;
 
@@ -205,23 +245,24 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
 
   // Handle movement commands (left, right, center)
   else if (strcmp(topic, topic_command) == 0) {
-    message.toLowerCase();
+    String command = parseCommandFromMessage(message);
+    command.toLowerCase();
 
-    if (message == "left" || message == "move_left") {
+    if (command == "left" || command == "move_left") {
       targetAngle = constrain(currentAngle - SERVO_STEP_SIZE, SERVO_MIN_ANGLE, SERVO_MAX_ANGLE);
       Serial.print("← Moving left to: ");
       Serial.println(targetAngle);
-    } else if (message == "right" || message == "move_right") {
+    } else if (command == "right" || command == "move_right") {
       targetAngle = constrain(currentAngle + SERVO_STEP_SIZE, SERVO_MIN_ANGLE, SERVO_MAX_ANGLE);
       Serial.print("→ Moving right to: ");
       Serial.println(targetAngle);
-    } else if (message == "center") {
+    } else if (command == "center") {
       targetAngle = SERVO_CENTER_ANGLE;
       Serial.print("⊙ Centering to: ");
       Serial.println(targetAngle);
     } else {
       Serial.print("✗ Unknown command: ");
-      Serial.println(message);
+      Serial.println(command);
     }
   }
 }

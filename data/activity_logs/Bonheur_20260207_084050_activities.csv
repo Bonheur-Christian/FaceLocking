@@ -1,6 +1,0 @@
-timestamp,frame_number,activity_type,face_center_x,face_center_y,details
-2026-02-07T08:41:06.253858,227,move_right,401.5,315.0,dx=65.5px
-2026-02-07T08:41:06.254144,227,move_down,401.5,315.0,dy=62.0px
-2026-02-07T08:41:06.566914,228,blink,448.0,310.0,
-2026-02-07T08:41:07.809775,232,move_left,399.5,306.5,dx=-46.5px
-2026-02-07T08:41:09.608528,238,move_right,404.5,313.0,dx=47.5px

@@ -7,13 +7,8 @@ import sys
 import cv2
 import numpy as np
 
-try:
-    import mediapipe as mp
-except ImportError:
-    print("ERROR: mediapipe not installed. Run: pip install mediapipe")
-    sys.exit(1)
-
 from . import config
+from .face_mesh import FaceMesh
 
 
 def main():
@@ -29,7 +24,7 @@ def main():
         return False
     
     # Initialize FaceMesh
-    mp_face_mesh = mp.solutions.face_mesh.FaceMesh(
+    mp_face_mesh = FaceMesh(
         static_image_mode=config.FACEMESH_STATIC_MODE,
         max_num_faces=config.FACEMESH_MAX_NUM_FACES,
         refine_landmarks=config.FACEMESH_REFINE_LANDMARKS,

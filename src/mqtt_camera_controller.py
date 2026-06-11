@@ -1,290 +1,137 @@
 """
-MQTT Camera Controller
-Publishes camera movement commands to ESP8266 servo controller.
+MQTT camera controller — publishes pan commands to ESP8266 servo firmware.
 """
 
 import json
 import time
 from typing import Optional
+
 import paho.mqtt.client as mqtt
+
+from . import config
 
 
 class MQTTCameraController:
     """Control camera servo via MQTT."""
-    
+
     def __init__(
         self,
-        broker_host: str = "157.173.101.159",
-        broker_port: int = 1883,
+        broker_host: str = None,
+        broker_port: int = None,
         username: Optional[str] = None,
-        password: Optional[str] = None
+        password: Optional[str] = None,
     ):
-        """
-        Initialize MQTT camera controller.
-        
-        Args:
-            broker_host: MQTT broker hostname/IP
-            broker_port: MQTT broker port (default 1883)
-            username: MQTT username (optional)
-            password: MQTT password (optional)
-        """
-        self.broker_host = broker_host
-        self.broker_port = broker_port
-        self.username = username
-        self.password = password
-        
-        # MQTT topics
-        self.topic_horizontal = "camera/track/horizontal"
-        self.topic_command = "camera/track/command"
-        self.topic_status = "camera/status"
-        
-        # Camera state
-        self.current_angle = 90  # Center position
+        self.broker_host = broker_host or config.MQTT_BROKER_HOST
+        self.broker_port = broker_port or config.MQTT_BROKER_PORT
+        self.username = username if username is not None else config.MQTT_USERNAME
+        self.password = password if password is not None else config.MQTT_PASSWORD
+
+        self.topic_horizontal = config.MQTT_TOPIC_HORIZONTAL
+        self.topic_command = config.MQTT_TOPIC_COMMAND
+        self.topic_status = config.MQTT_TOPIC_STATUS
+
+        self.current_angle = config.SERVO_CENTER_ANGLE
         self.is_connected = False
-        self.last_status = {}
-        
-        # Movement parameters
-        self.min_angle = 0
-        self.max_angle = 180
-        self.center_angle = 90
-        
-        # Initialize MQTT client
-        self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="FaceRecognition_Controller")
-        
-        if username and password:
-            self.client.username_pw_set(username, password)
-        
-        # Set callbacks
+        self.last_status: dict = {}
+        self._last_publish_ms = 0.0
+
+        self.client = mqtt.Client(
+            mqtt.CallbackAPIVersion.VERSION2,
+            client_id="FaceLocking_Controller",
+        )
+        if self.username and self.password:
+            self.client.username_pw_set(self.username, self.password)
+
         self.client.on_connect = self._on_connect
         self.client.on_disconnect = self._on_disconnect
         self.client.on_message = self._on_message
-        
-        # Connect to broker
+        self.client.reconnect_delay_set(min_delay=1, max_delay=30)
+
         try:
-            self.client.connect(broker_host, broker_port, keepalive=60)
+            self.client.connect(self.broker_host, self.broker_port, keepalive=config.MQTT_KEEPALIVE)
             self.client.loop_start()
-            print(f"✓ MQTT Controller initialized")
-            print(f"  Broker: {broker_host}:{broker_port}")
-        except Exception as e:
-            print(f"✗ Failed to connect to MQTT broker: {e}")
-            print(f"  Make sure broker is running at {broker_host}:{broker_port}")
-    
+            print(f"✓ MQTT connecting to {self.broker_host}:{self.broker_port}")
+        except Exception as exc:
+            print(f"✗ MQTT connection failed: {exc}")
+
     def _on_connect(self, client, userdata, flags, rc, properties=None):
-        """Callback when connected to MQTT broker."""
         if rc == 0:
             self.is_connected = True
-            print("✓ Connected to MQTT broker")
-            # Subscribe to status topic
-            self.client.subscribe(self.topic_status)
-            print(f"  Subscribed to: {self.topic_status}")
+            client.subscribe(self.topic_status, qos=config.MQTT_QOS)
+            print(f"✓ MQTT connected, subscribed to {self.topic_status}")
         else:
-            print(f"✗ Connection failed with code {rc}")
-    
-    def _on_disconnect(self, client, userdata, rc):
-        """Callback when disconnected from MQTT broker."""
+            print(f"✗ MQTT connect failed rc={rc}")
+
+    def _on_disconnect(self, client, userdata, rc, properties=None):
         self.is_connected = False
         if rc != 0:
-            print(f"⚠ Unexpected disconnection from MQTT broker (code {rc})")
-    
+            print(f"⚠ MQTT disconnected rc={rc}")
+
     def _on_message(self, client, userdata, msg):
-        """Callback when message received."""
+        if msg.topic != self.topic_status:
+            return
         try:
-            if msg.topic == self.topic_status:
-                status = json.loads(msg.payload.decode())
-                self.last_status = status
-                self.current_angle = status.get("angle", self.current_angle)
-        except Exception as e:
-            print(f"Error parsing status message: {e}")
-    
-    def move_to_angle(self, angle: int) -> bool:
-        """
-        Move camera to specific angle.
-        
-        Args:
-            angle: Target angle (0-180 degrees)
-            
-        Returns:
-            True if command sent successfully
-        """
-        if not self.is_connected:
-            print("⚠ Not connected to MQTT broker")
-            return False
-        
-        # Constrain angle
-        angle = max(self.min_angle, min(self.max_angle, angle))
-        
-        try:
-            self.client.publish(self.topic_horizontal, str(angle))
-            print(f"→ Camera angle: {angle}°")
+            payload = msg.payload.decode()
+            if payload.startswith("{"):
+                self.last_status = json.loads(payload)
+            else:
+                self.last_status = {"raw": payload}
+            angle = self.last_status.get("angle")
+            if angle is not None:
+                self.current_angle = int(angle)
+        except Exception:
+            pass
+
+    def _rate_limited(self) -> bool:
+        now = time.time() * 1000.0
+        if now - self._last_publish_ms < config.MQTT_MIN_COMMAND_INTERVAL_MS:
             return True
-        except Exception as e:
-            print(f"✗ Failed to send angle command: {e}")
-            return False
-    
-    def move_left(self) -> bool:
-        """Move camera left."""
-        if not self.is_connected:
-            return False
-        
-        try:
-            self.client.publish(self.topic_command, "left")
-            print("← Camera moving left")
-            return True
-        except Exception as e:
-            print(f"✗ Failed to send left command: {e}")
-            return False
-    
-    def move_right(self) -> bool:
-        """Move camera right."""
-        if not self.is_connected:
-            return False
-        
-        try:
-            self.client.publish(self.topic_command, "right")
-            print("→ Camera moving right")
-            return True
-        except Exception as e:
-            print(f"✗ Failed to send right command: {e}")
-            return False
-    
-    def center(self) -> bool:
-        """Center camera."""
-        if not self.is_connected:
-            return False
-        
-        try:
-            self.client.publish(self.topic_command, "center")
-            print("⊙ Camera centering")
-            return True
-        except Exception as e:
-            print(f"✗ Failed to send center command: {e}")
-            return False
-    
-    def search_sweep(self, sweep_index: int = 0) -> tuple:
-        """
-        Perform search sweep pattern across full 180 degrees.
-        Returns next angle and updated index.
-        
-        Args:
-            sweep_index: Current index in sweep pattern (0-11)
-            
-        Returns:
-            Tuple of (next_angle, next_index)
-        """
-        # Full 180-degree sweep pattern: 0 -> 30 -> 60 -> 90 -> 120 -> 150 -> 180 -> 150 -> 120 -> 90 -> 60 -> 30 -> (repeat)
-        sweep_positions = [0, 30, 60, 90, 120, 150, 180, 150, 120, 90, 60, 30]
-        
-        # Get next position
-        next_idx = (sweep_index + 1) % len(sweep_positions)
-        next_angle = sweep_positions[next_idx]
-        
-        self.move_to_angle(next_angle)
-        return next_angle, next_idx
-    
-    def track_face_position(self, face_center_x: float, frame_width: int) -> bool:
-        """
-        Calculate and send servo angle based on face position.
-        
-        Args:
-            face_center_x: X coordinate of face center
-            frame_width: Width of video frame
-            
-        Returns:
-            True if command sent successfully
-        """
-        if not self.is_connected:
-            return False
-        
-        # Calculate normalized position (0.0 = left, 0.5 = center, 1.0 = right)
-        normalized_x = face_center_x / frame_width
-        
-        # Map to servo angle (0-180 degrees)
-        # Note: You may need to invert this depending on your servo orientation
-        target_angle = int(normalized_x * (self.max_angle - self.min_angle) + self.min_angle)
-        
-        return self.move_to_angle(target_angle)
-    
-    def track_face_movement(self, movement_type: str) -> bool:
-        """
-        Send movement command based on detected face movement.
-        
-        Args:
-            movement_type: "move_left", "move_right", etc.
-            
-        Returns:
-            True if command sent successfully
-        """
-        if not self.is_connected:
-            print("⚠️  MQTT not connected - cannot send command")
-            return False
-        
-        print(f"📤 Sending MQTT command for: {movement_type}")
-        
-        if movement_type == "move_left":
-            return self.move_right()  # Camera moves opposite to face
-        elif movement_type == "move_right":
-            return self.move_left()  # Camera moves opposite to face
-        
+        self._last_publish_ms = now
         return False
-    
-    def get_status(self) -> dict:
-        """Get last known camera status."""
-        return self.last_status.copy()
-    
-    def disconnect(self):
-        """Disconnect from MQTT broker."""
-        if self.is_connected:
+
+    def _publish(self, topic: str, payload: str) -> bool:
+        if not self.is_connected:
+            return False
+        if self._rate_limited():
+            return False
+        result = self.client.publish(topic, payload, qos=config.MQTT_QOS)
+        return result.rc == mqtt.MQTT_ERR_SUCCESS
+
+    def move_to_angle(self, angle: int) -> bool:
+        angle = int(max(config.SERVO_MIN_ANGLE, min(config.SERVO_MAX_ANGLE, angle)))
+        if abs(angle - self.current_angle) < 1:
+            return False
+        ok = self._publish(self.topic_horizontal, str(angle))
+        if ok:
+            self.current_angle = angle
+        return ok
+
+    def send_command(self, command: str) -> bool:
+        return self._publish(self.topic_command, command)
+
+    def move_left(self, step: int = None) -> bool:
+        step = step or config.SERVO_STEP_SIZE
+        return self.move_to_angle(self.current_angle - step)
+
+    def move_right(self, step: int = None) -> bool:
+        step = step or config.SERVO_STEP_SIZE
+        return self.move_to_angle(self.current_angle + step)
+
+    def center(self) -> bool:
+        return self.move_to_angle(config.SERVO_CENTER_ANGLE)
+
+    def wait_for_connection(self, timeout_sec: float = 5.0) -> bool:
+        """Block until connected or timeout (connect is async via loop_start)."""
+        deadline = time.time() + timeout_sec
+        while time.time() < deadline:
+            if self.is_connected:
+                return True
+            time.sleep(0.1)
+        return self.is_connected
+
+    def close(self) -> None:
+        try:
             self.client.loop_stop()
             self.client.disconnect()
-            print("✓ Disconnected from MQTT broker")
-
-
-# Example usage
-if __name__ == "__main__":
-    # Initialize controller
-    controller = MQTTCameraController(
-        broker_host="localhost",  # Change to your broker IP
-        broker_port=1883
-    )
-    
-    # Wait for connection
-    time.sleep(2)
-    
-    if controller.is_connected:
-        print("\nTesting camera movements...")
-        
-        # Test center
-        print("\n1. Centering camera...")
-        controller.center()
-        time.sleep(2)
-        
-        # Test left movement
-        print("\n2. Moving left...")
-        for i in range(3):
-            controller.move_left()
-            time.sleep(1)
-        
-        # Test right movement
-        print("\n3. Moving right...")
-        for i in range(3):
-            controller.move_right()
-            time.sleep(1)
-        
-        # Test specific angles
-        print("\n4. Testing specific angles...")
-        for angle in [45, 90, 135]:
-            print(f"   Moving to {angle}°...")
-            controller.move_to_angle(angle)
-            time.sleep(2)
-        
-        # Get status
-        print("\n5. Camera status:")
-        status = controller.get_status()
-        print(f"   {status}")
-        
-        print("\n✓ Test complete!")
-    else:
-        print("\n✗ Could not connect to MQTT broker")
-        print("  Make sure mosquitto or another MQTT broker is running")
-    
-    controller.disconnect()
+        except Exception:
+            pass

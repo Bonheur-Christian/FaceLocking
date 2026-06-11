@@ -15,13 +15,8 @@ except ImportError:
     print("ERROR: onnxruntime not installed. Run: pip install onnxruntime")
     sys.exit(1)
 
-try:
-    import mediapipe as mp
-except ImportError:
-    print("ERROR: mediapipe not installed. Run: pip install mediapipe")
-    sys.exit(1)
-
 from . import config
+from .face_mesh import FaceMesh
 from .align import FaceAligner
 
 
@@ -37,10 +32,13 @@ class ArcFaceEmbedder:
                 "Please download ArcFace ONNX model (see README)."
             )
         
-        # Initialize ONNX Runtime
+        sess_options = ort.SessionOptions()
+        sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        sess_options.intra_op_num_threads = config.ONNX_INTRA_OP_THREADS
         self.session = ort.InferenceSession(
             str(self.model_path),
-            providers=[config.ONNX_EXECUTION_PROVIDER]
+            sess_options=sess_options,
+            providers=[config.ONNX_EXECUTION_PROVIDER],
         )
         
         self.input_name = self.session.get_inputs()[0].name
@@ -89,8 +87,17 @@ class ArcFaceEmbedder:
         norm_before = np.linalg.norm(v)
         
         v_normalized = self._l2_normalize(v)
-        
+
         return v_normalized, norm_before
+
+    def embed_batch(self, aligned_images: list) -> np.ndarray:
+        """Embed multiple faces; vectorized matching happens in process_faces."""
+        if not aligned_images:
+            return np.zeros((0, config.EMBEDDING_DIM), dtype=np.float32)
+        return np.stack(
+            [self.embed(img)[0] for img in aligned_images],
+            axis=0,
+        ).astype(np.float32)
 
 
 def main():
@@ -102,7 +109,7 @@ def main():
         print("ERROR: Failed to load Haar cascade.")
         return False
     
-    mp_face_mesh = mp.solutions.face_mesh.FaceMesh(
+    mp_face_mesh = FaceMesh(
         static_image_mode=config.FACEMESH_STATIC_MODE,
         max_num_faces=1,
         refine_landmarks=config.FACEMESH_REFINE_LANDMARKS,

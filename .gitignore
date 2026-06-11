@@ -2,3 +2,4 @@
 models/
 *.onnx
 __pycache__/
+*.pyc

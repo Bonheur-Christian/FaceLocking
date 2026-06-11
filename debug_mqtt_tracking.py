@@ -1,82 +1,51 @@
 #!/usr/bin/env python3
-"""
-Debug MQTT Camera Tracking
-Helps diagnose why servo isn't moving when face moves.
-"""
+"""Monitor MQTT camera tracking topics."""
 
+import json
 import sys
-import time
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).parent))
 
 import paho.mqtt.client as mqtt
+
+from src import config
 
 
 def on_connect(client, userdata, flags, rc, properties=None):
     if rc == 0:
-        print("✅ Connected to MQTT broker")
-        client.subscribe("camera/#")
-        print("✅ Subscribed to camera/* topics")
+        print("✓ Connected to broker")
+        client.subscribe(config.MQTT_TOPIC_HORIZONTAL)
+        client.subscribe(config.MQTT_TOPIC_COMMAND)
+        client.subscribe(config.MQTT_TOPIC_STATUS)
+        print(f"  Subscribed: {config.MQTT_TOPIC_HORIZONTAL}")
+        print(f"  Subscribed: {config.MQTT_TOPIC_COMMAND}")
+        print(f"  Subscribed: {config.MQTT_TOPIC_STATUS}")
     else:
-        print(f"❌ Connection failed with code {rc}")
+        print(f"✗ Connect failed rc={rc}")
 
 
 def on_message(client, userdata, msg):
-    print(f"📨 [{msg.topic}] {msg.payload.decode()}")
+    payload = msg.payload.decode()
+    print(f"[{msg.topic}] {payload}")
+    if msg.topic == config.MQTT_TOPIC_STATUS and payload.startswith("{"):
+        try:
+            status = json.loads(payload)
+            print(f"  angle={status.get('angle')} moving={status.get('moving')}")
+        except json.JSONDecodeError:
+            pass
 
 
 def main():
-    print("=" * 60)
-    print("MQTT Camera Tracking Debugger")
-    print("=" * 60)
-    print()
-    print("This tool monitors MQTT messages to help debug tracking issues.")
-    print()
-    
-    # Test 1: Check MQTT broker connection
-    print("Test 1: Connecting to MQTT broker...")
-    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, "DebugTool")
+    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="FaceLocking_Debug")
     client.on_connect = on_connect
     client.on_message = on_message
-    
-    try:
-        client.connect("localhost", 1883, 60)
-    except Exception as e:
-        print(f"❌ Cannot connect to MQTT broker: {e}")
-        print()
-        print("Solutions:")
-        print("  1. Start mosquitto:")
-        print("     - macOS: brew services start mosquitto")
-        print("     - Linux: sudo systemctl start mosquitto")
-        print("     - Windows: net start mosquitto")
-        print("  2. Check if running: ps aux | grep mosquitto")
-        return False
-    
-    print()
-    print("=" * 60)
-    print("Monitoring MQTT messages...")
-    print("=" * 60)
-    print()
-    print("Now run: python -m src.recognize_with_tracking")
-    print()
-    print("Expected messages when face moves:")
-    print("  - camera/track/command: left")
-    print("  - camera/track/command: right")
-    print("  - camera/track/horizontal: <angle>")
-    print("  - camera/status: {\"angle\":...}")
-    print()
-    print("Press Ctrl+C to stop monitoring")
-    print()
-    
+    print(f"Connecting to {config.MQTT_BROKER_HOST}:{config.MQTT_BROKER_PORT}...")
+    client.connect(config.MQTT_BROKER_HOST, config.MQTT_BROKER_PORT, 60)
+    print("Listening (Ctrl+C to stop)...")
     try:
         client.loop_forever()
     except KeyboardInterrupt:
-        print("\n\nStopping monitor...")
-        client.disconnect()
-        return True
+        print("\nStopped.")
+    return True
 
 
 if __name__ == "__main__":
-    success = main()
-    sys.exit(0 if success else 1)
+    sys.exit(0 if main() else 1)

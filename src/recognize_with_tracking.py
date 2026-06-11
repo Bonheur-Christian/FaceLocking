@@ -1,581 +1,434 @@
 """
-Live face recognition with MQTT camera tracking.
-Tracks locked person and sends servo commands to ESP8266.
+Live face recognition with MQTT pan tracking and autonomous lost-target search.
+
+State machine
+-------------
+IDLE      : no identity selected to lock (recognition still runs).
+TRACKING  : locked target visible, servo actively centering it.
+LOCKED    : locked target visible and centered/stable.
+SEARCHING : locked target missing beyond LOST_TARGET_TIMEOUT — autonomous,
+            direction-aware servo sweep while recognition keeps hunting for the
+            ORIGINAL locked identity. Never locks anyone else.
+
+Performance & multi-face strategy
+---------------------------------
+Detection runs every frame (smooth boxes). ArcFace embedding is the expensive
+step, so the FaceTracker caches recognition per persistent track ID and only
+re-embeds on an interval (more often for the locked track). The lock is bound
+to a track ID, which prevents identity/lock switching when other known faces
+appear.
 """
 
 import sys
-import json
-from pathlib import Path
+import time
 from typing import Dict, List, Optional, Tuple
+
 import cv2
 import numpy as np
 
 from . import config
-from .haar_5pt import HaarMediaPipeFaceDetector
-from .align import FaceAligner
-from .embed import ArcFaceEmbedder
 from . import actions as action_module
 from .activity_logger import ActivityLogger
+from .align import FaceAligner
+from .embed import ArcFaceEmbedder
+from .haar_5pt import HaarMediaPipeFaceDetector
+from .face_tracker import FaceTracker
 from .mqtt_camera_controller import MQTTCameraController
+from .recognition_core import (
+    choose_lock_identity,
+    draw_tracks,
+    load_database,
+    open_camera,
+    recognize_face,
+)
+from .tracking import PanTracker
+from .tracking_log import TrackingLogger
+from .camera_utils import CameraStream
 
 
-def load_database():
-    """Load enrolled face database."""
-    if not config.DB_NPZ_PATH.exists():
-        print("ERROR: Database not found. Run enrollment first.")
-        return {}
-    
-    data = np.load(str(config.DB_NPZ_PATH), allow_pickle=True)
-    return {k: data[k].astype(np.float32) for k in data.files}
+def _draw_debug_overlay(
+    vis: np.ndarray,
+    state: str,
+    lock_name: Optional[str],
+    servo_angle,
+    face_count: int,
+    recog_fps: float,
+    track_fps: float,
+    mqtt_ok: bool,
+    threshold: float,
+    lost_for: float,
+) -> None:
+    """On-screen diagnostics panel (Issue #8)."""
+    lines = [
+        f"State: {state}",
+        f"Locked: {lock_name or '(none)'}",
+        f"Servo: {servo_angle}",
+        f"Faces: {face_count}",
+        f"Recog FPS: {recog_fps:.1f}",
+        f"Track FPS: {track_fps:.1f}",
+        f"MQTT: {'OK' if mqtt_ok else '--'}",
+        f"Thresh: {threshold:.2f}",
+    ]
+    if state == "SEARCHING":
+        lines.append(f"Lost for: {lost_for:.1f}s")
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    pad = 6
+    line_h = 20
+    panel_w = 210
+    panel_h = line_h * len(lines) + pad
+    overlay = vis.copy()
+    cv2.rectangle(overlay, (0, 0), (panel_w, panel_h), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.45, vis, 0.55, 0, vis)
+
+    state_color = {
+        "LOCKED": config.COLOR_LOCKED,
+        "TRACKING": (0, 255, 255),
+        "SEARCHING": config.COLOR_LOST,
+        "IDLE": (200, 200, 200),
+    }.get(state, config.COLOR_HUD)
+
+    y = pad + 14
+    for i, t in enumerate(lines):
+        color = state_color if i == 0 else config.COLOR_HUD
+        cv2.putText(vis, t, (pad, y), font, 0.5, color, 1, cv2.LINE_AA)
+        y += line_h
 
 
-def choose_lock_identity(names: list) -> Optional[str]:
-    """Prompt user to choose one identity to lock to."""
-    if not names:
-        return None
-    print("\nEnrolled identities:")
-    for i, n in enumerate(names, 1):
-        print(f"  {i}. {n}")
-    print("Lock/track one person? Enter number or name (or Enter for none): ", end="")
-    try:
-        raw = input().strip()
-    except EOFError:
-        return None
-    if not raw:
-        return None
-    
-    if raw.isdigit():
-        idx = int(raw)
-        if 1 <= idx <= len(names):
-            return names[idx - 1]
-        return None
-    
-    if raw in names:
-        return raw
-    
-    low = raw.lower()
-    for n in names:
-        if n.lower() == low:
-            return n
-    print(f"Unknown name '{raw}'. Proceeding with all identities.")
-    return None
-
-
-def cosine_distance(a: np.ndarray, b: np.ndarray) -> float:
-    """Compute cosine distance."""
-    a = a.reshape(-1).astype(np.float32)
-    b = b.reshape(-1).astype(np.float32)
-    similarity = float(np.dot(a, b))
-    return 1.0 - similarity
+def _draw_search_banner(vis: np.ndarray, lock_name: str) -> None:
+    text = f"SEARCHING FOR TARGET: {lock_name}"
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    (tw, th), _ = cv2.getTextSize(text, font, 0.8, 2)
+    x = (vis.shape[1] - tw) // 2
+    y = 40
+    cv2.rectangle(vis, (x - 10, y - th - 8), (x + tw + 10, y + 8), config.COLOR_LOST, -1)
+    cv2.putText(vis, text, (x, y), font, 0.8, (0, 0, 0), 2, cv2.LINE_AA)
 
 
 def main(
     start_fullscreen: bool = False,
     enable_mqtt: bool = True,
     mqtt_broker: str = None,
-    mqtt_port: int = None
-):
-    """
-    Live recognition with MQTT camera tracking.
-    
-    Args:
-        start_fullscreen: If True, start in fullscreen mode
-        enable_mqtt: Enable MQTT camera tracking
-        mqtt_broker: MQTT broker hostname/IP (None = use config default)
-        mqtt_port: MQTT broker port (None = use config default)
-    """
-    # Use config defaults if not specified
-    if mqtt_broker is None:
-        mqtt_broker = config.MQTT_BROKER_HOST
-    if mqtt_port is None:
-        mqtt_port = config.MQTT_BROKER_PORT
-    
+    mqtt_port: int = None,
+) -> bool:
     db = load_database()
-    
     if not db:
-        print("ERROR: No enrolled identities found. Run enrollment first.")
+        print("ERROR: No enrolled identities. Run: python -m src.enroll")
         return False
-    
+
     print(f"✓ Loaded {len(db)} enrolled identities")
-    
+
     detector = HaarMediaPipeFaceDetector(min_size=config.HAAR_MIN_SIZE)
     aligner = FaceAligner()
     embedder = ArcFaceEmbedder(config.ARCFACE_MODEL_PATH)
-    
+
     names = sorted(db.keys())
-    embeddings_matrix = np.stack([db[n].reshape(-1) for n in names], axis=0)
-    
+    embeddings_matrix = np.stack([db[n].reshape(-1) for n in names], axis=0).astype(np.float32)
+
     lock_name: Optional[str] = choose_lock_identity(names)
-    
-    # Initialize MQTT camera controller
-    mqtt_controller: Optional[MQTTCameraController] = None
-    if enable_mqtt and lock_name:
-        print(f"\n🎥 Initializing MQTT camera tracking...")
-        try:
-            mqtt_controller = MQTTCameraController(
-                broker_host=mqtt_broker,
-                broker_port=mqtt_port
-            )
-            import time
-            time.sleep(1)  # Wait for connection
-            if mqtt_controller.is_connected:
-                print("✓ Camera tracking enabled!")
-                mqtt_controller.center()  # Center camera at start
-            else:
-                print("⚠ MQTT not connected - tracking disabled")
-                mqtt_controller = None
-        except Exception as e:
-            print(f"⚠ Could not initialize MQTT: {e}")
-            mqtt_controller = None
-    
-    # Initialize activity logger
+    if not lock_name:
+        print("WARNING: No lock selected. Running recognition only (IDLE).")
+
+    mqtt: Optional[MQTTCameraController] = None
+    if enable_mqtt:
+        mqtt = MQTTCameraController(broker_host=mqtt_broker, broker_port=mqtt_port)
+        if not mqtt.wait_for_connection(timeout_sec=5.0):
+            print("✗ MQTT NOT CONNECTED — servo will NOT move.")
+            print(f"  Broker: {mqtt_broker or config.MQTT_BROKER_HOST}:{mqtt_port or config.MQTT_BROKER_PORT}")
+            print("  Fix: run python test_mqtt_system.py  OR  python test_simple_tracking.py")
+            print("  Check: broker IP reachable, ESP8266 on same WiFi, firmware flashed.")
+        else:
+            mqtt.center()
+            print("✓ MQTT ready — servo centered to start")
+    tracker = FaceTracker()
+    tlog = TrackingLogger()
+    pan = PanTracker(mqtt=mqtt, logger=tlog)
+
     activity_logger: Optional[ActivityLogger] = None
     if lock_name:
-        print(f"Lock: {lock_name} (camera will track this person)")
-        print(f"✓ Activity history will be saved to: {config.HISTORY_DIR}/")
         activity_logger = ActivityLogger(lock_name, config.HISTORY_DIR)
-    else:
-        print("Lock: (none) – all enrolled identities shown by name")
-    
-    # Camera setup
-    cap = None
-    for attempt in range(3):
-        cap = cv2.VideoCapture(config.CAMERA_INDEX)
-        if cap.isOpened():
-            break
-        cap.release()
-        if attempt < 2:
-            print(f"Attempt {attempt + 1}/3: Camera not ready, retrying...")
-            import time
-            time.sleep(1)
-    
-    if not cap or not cap.isOpened():
-        print("ERROR: Cannot open camera after 3 attempts.")
+
+    cam = open_camera()
+    if cam is None:
+        print("ERROR: Cannot open camera.")
+        print("Run: python -m src.camera_utils to find the correct camera index.")
         return False
-    
-    # Get frame dimensions for tracking calculations
-    ret, test_frame = cap.read()
-    if not ret:
-        print("ERROR: Cannot read from camera")
-        return False
-    frame_height, frame_width = test_frame.shape[:2]
-    print(f"✓ Camera resolution: {frame_width}x{frame_height}")
-    
-    threshold = config.DEFAULT_DISTANCE_THRESHOLD
-    
-    print("\n🎬 Live Recognition with Camera Tracking")
-    print("Controls:")
-    print("  q  - Quit")
-    print("  r  - Reload database")
-    print("  l  - Clear lock")
-    print("  f  - Toggle fullscreen")
-    print("  c  - Center camera")
-    print("  s  - Toggle search mode on/off")
-    print("  +  - Increase threshold")
-    print("  -  - Decrease threshold")
-    
-    # Action detection state
-    baseline_mouth_width: Optional[float] = None
+
+    threshold = config.RECOGNITION_THRESHOLD
+    baseline_mouth_width = None
     mouth_width_samples: List[float] = []
     last_action_frame: Dict[str, int] = {}
     frame_idx = 0
     action_display: List[Tuple[str, int]] = []
-    ACTION_DISPLAY_DURATION = 20
-    
-    # Tracking state
-    last_tracked_x = None
-    tracking_smoothing = []  # Smooth tracking over multiple frames
-    TRACKING_SMOOTH_WINDOW = 5
-    
-    # Centering state
-    person_centered = False
-    centering_tolerance = frame_width * config.CENTERING_TOLERANCE  # From config
-    frames_centered = 0
-    FRAMES_TO_LOCK_CENTER = config.FRAMES_TO_LOCK_CENTER  # From config
-    
-    # Search mode state (when person not found)
-    search_mode = False
-    frames_without_person = 0
-    FRAMES_BEFORE_SEARCH = 20  # Start searching after 20 frames (~2 seconds at 10 FPS)
-    last_search_time = 0
-    SEARCH_INTERVAL = 2.0  # Move to next position every 2 seconds
-    sweep_positions = [0, 30, 60, 90, 120, 150, 180, 150, 120, 90, 60, 30]  # Full sweep pattern
-    search_sweep_index = 0  # Index in sweep pattern
-    
-    # Fullscreen state
-    is_fullscreen = start_fullscreen
-    window_name = "Live Recognition + Tracking"
-    
+    ACTION_DISPLAY_DURATION = 15
+
+    lost_since: Optional[float] = None
+    prev_locked_track_id: Optional[int] = None
+    state = "IDLE"
+
+    # FPS accounting (tracking = loop rate, recognition = embeddings/sec).
+    t_loop = time.time()
+    loop_count = 0
+    track_fps = 0.0
+    recog_events = 0
+    t_recog = time.time()
+    recog_fps = 0.0
+    last_frame = None
+    camera_warning_frames = 0
+
+    window_name = "Face Tracking"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
-    cv2.resizeWindow(window_name, 1920, 1080)
-    
+    cv2.resizeWindow(window_name, config.DISPLAY_WINDOW_WIDTH, config.DISPLAY_WINDOW_HEIGHT)
     if start_fullscreen:
         cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
-        print("Starting in FULLSCREEN mode")
-    
+
+    print("\nFace Recognition + MQTT Tracking + Search")
+    print("Controls: q=quit  r=reload  l=unlock  k=lock  s=search  c=center  f=fullscreen  +/-=threshold")
+    if config.TRACKING_LOG_ENABLED:
+        print("Tracking logs: ON (set TRACKING_LOG_ENABLED=False in config.py to disable)")
+        if lock_name:
+            tlog.lock_armed(lock_name)
+
     try:
-        import time
-        t0 = time.time()
-        frame_count = 0
-        fps = 0
-        
         while True:
-            ret, frame = cap.read()
+            ret, frame = cam.read()
             if not ret:
-                break
-            
+                if last_frame is None:
+                    time.sleep(0.05)
+                    continue
+                frame = last_frame.copy()
+                camera_warning_frames += 1
+                if camera_warning_frames == 1:
+                    print("⚠ Camera frame lost — retrying (tracking continues)...")
+            else:
+                last_frame = frame
+                camera_warning_frames = 0
+
             frame_idx += 1
-            frame_count += 1
-            elapsed = time.time() - t0
-            if elapsed >= 1.0:
-                fps = frame_count / elapsed
-                frame_count = 0
-                t0 = time.time()
-            
-            vis = frame.copy()
-            faces = detector.detect(frame)
-            
-            # Smile / blink detection
-            detected_actions = []
-            if faces and hasattr(action_module, "detect_smile_blink"):
-                cooldown = getattr(config, "LOCK_ACTION_COOLDOWN_FRAMES", 10)
+            loop_count += 1
+            frame_w = frame.shape[1]
+
+            # --- Detect + associate (every frame when faces/search active) ---
+            search_active = (
+                lock_name
+                and lost_since is not None
+                and (time.time() - lost_since) >= config.LOST_TARGET_TIMEOUT
+            )
+            tracking_active = (
+                bool(tracker.visible_tracks())
+                or tracker.locked_track_id is not None
+                or bool(lock_name)
+                or search_active
+                or pan.search_manual
+            )
+            if tracking_active:
+                run_detect = frame_idx % config.DETECT_EVERY_N_FRAMES_FACE == 0
+            else:
+                run_detect = frame_idx % config.DETECT_EVERY_N_FRAMES_IDLE == 0
+            if run_detect:
+                detections = detector.detect(frame)[: config.MAX_FACES]
+                visible = tracker.update(detections, frame_idx, frame_w)
+            else:
+                visible = tracker.visible_tracks()
+            faces_present = bool(visible)
+
+            # --- Recognition pass (cached; locked first) -------------------
+            locked = tracker.locked_track
+            ordered = sorted(
+                visible,
+                key=lambda t: (t.track_id != tracker.locked_track_id, t.track_id),
+            )
+            budget = config.MAX_FACES
+            for tr in ordered:
+                if budget <= 0:
+                    break
+                is_lk = tr.track_id == tracker.locked_track_id
+                if tr.needs_recognition(frame_idx, is_lk, faces_present=faces_present):
+                    name, dist, accepted = recognize_face(
+                        frame, tr.landmarks, aligner, embedder,
+                        embeddings_matrix, names, threshold,
+                    )
+                    tr.apply_recognition(name, dist, accepted, frame_idx)
+                    recog_events += 1
+                    budget -= 1
+
+            # --- Lock acquisition / reacquisition --------------------------
+            if lock_name and tracker.locked_track_id is None:
+                candidate = tracker.acquire_lock(lock_name)
+                if candidate is not None:
+                    pan.reset()  # drop any search sweep, resume clean tracking
+                    print(f"✓ Locked onto {lock_name} (track #{candidate.track_id})")
+
+            locked = tracker.locked_track
+
+            # --- Servo control + state machine -----------------------------
+            if not lock_name:
+                state = "IDLE"
+                lost_since = None
+                prev_locked_track_id = None
+                tlog.idle()
+            elif locked is not None:
+                if prev_locked_track_id is None and lost_since is not None:
+                    tlog.target_visible(
+                        lock_name, locked.track_id, locked.center, pan.current_angle,
+                    )
+                elif prev_locked_track_id != locked.track_id:
+                    tlog.target_visible(
+                        lock_name, locked.track_id, locked.center, pan.current_angle,
+                    )
+                lost_since = None
+                prev_locked_track_id = locked.track_id
+                label, _ = pan.track(locked.center[0], frame_w)
+                state = "LOCKED" if label == "centered" else "TRACKING"
+            else:
+                # Locked identity selected but its track is not currently bound.
+                if lost_since is None:
+                    lost_since = time.time()
+                    prev_locked_track_id = None
+                    tlog.target_lost(lock_name)
+                lost_for = time.time() - lost_since
+                if lost_for >= config.LOST_TARGET_TIMEOUT or pan.search_manual:
+                    if state != "SEARCHING":
+                        direction = "right" if pan.last_error_sign > 0 else "left" if pan.last_error_sign < 0 else "center"
+                        tlog.search_started(lock_name, pan.last_known_angle, direction)
+                    state = "SEARCHING"
+                    pan.search()
+                else:
+                    state = "TRACKING"  # brief grace period: hold position
+                    tlog.target_still_missing(lock_name, lost_for)
+                    tlog.servo_hold(pan.current_angle, "target out of frame — holding during grace period")
+
+            # --- Activity logging for the locked, visible target -----------
+            if (
+                lock_name and activity_logger and locked is not None
+                and frame_idx % config.ACTION_DETECT_EVERY_N_FRAMES == 0
+                and locked.full_landmarks
+            ):
                 detected_actions, baseline_mouth_width, mouth_width_samples = action_module.detect_smile_blink(
                     frame, baseline_mouth_width, mouth_width_samples,
-                    last_action_frame, frame_idx, cooldown_frames=cooldown,
+                    last_action_frame, frame_idx,
+                    cooldown_frames=config.LOCK_ACTION_COOLDOWN_FRAMES,
+                    landmarks_list=locked.full_landmarks,
                 )
                 for act in detected_actions:
+                    activity_logger.log_activity(act, frame_idx, locked.center)
                     action_display.append((act.capitalize() + "!", ACTION_DISPLAY_DURATION))
-            
+                for mv in activity_logger.detect_and_log_movement(locked.center, frame_idx):
+                    action_display.append((mv.replace("_", " ").title() + "!", ACTION_DISPLAY_DURATION))
+
             action_display = [(label, n - 1) for label, n in action_display if n > 1]
-            
-            locked_person_found = False
-            locked_face_center = None
-            
-            for face_idx, face in enumerate(faces):
-                aligned, _ = aligner.align(frame, face.landmarks)
-                query_emb, _ = embedder.embed(aligned)
-                
-                dists = np.array([cosine_distance(query_emb, embeddings_matrix[i]) for i in range(len(names))])
-                best_idx = int(np.argmin(dists))
-                best_dist = dists[best_idx]
-                best_match_name = names[best_idx]
-                
-                accepted = best_dist <= threshold
-                if accepted:
-                    name = best_match_name
-                    confidence = 1.0 - best_dist
-                    color = (0, 255, 0)
-                    
-                    if lock_name and best_match_name == lock_name:
-                        display_name = f"{name} (TRACKING)"
-                        is_locked_person = True
-                        locked_person_found = True
-                        locked_face_center = ((face.x1 + face.x2) / 2, (face.y1 + face.y2) / 2)
-                    else:
-                        display_name = name
-                        is_locked_person = False
-                else:
-                    name = "Unknown"
-                    display_name = "Unknown"
-                    confidence = 0
-                    color = (0, 0, 255)
-                    is_locked_person = False
-                
-                # Handle locked person
-                if is_locked_person:
-                    # Log activities
-                    if activity_logger:
-                        face_center = ((face.x1 + face.x2) / 2, (face.y1 + face.y2) / 2)
-                        
-                        for act in detected_actions:
-                            activity_logger.log_activity(act, frame_idx, face_center)
-                        
-                        movements = activity_logger.detect_and_log_movement(face_center, frame_idx)
-                        for movement in movements:
-                            action_display.append((movement.replace("_", " ").title() + "!", ACTION_DISPLAY_DURATION))
-                            
-                            # Send MQTT command for camera tracking (ONLY on detected movement)
-                            if mqtt_controller and mqtt_controller.is_connected:
-                                mqtt_controller.track_face_movement(movement)
-                    
-                    # Update camera position based on face location
-                    # ONLY track based on detected movements (left/right), NOT continuous position
-                    # This prevents constant camera adjustments that push person out of frame
-                    if mqtt_controller and mqtt_controller.is_connected:
-                        face_center_x = (face.x1 + face.x2) / 2
-                        frame_center_x = frame_width / 2
-                        
-                        # Calculate distance from center
-                        distance_from_center = abs(face_center_x - frame_center_x)
-                        
-                        # Check if person is centered
-                        if distance_from_center < centering_tolerance:
-                            frames_centered += 1
-                            if frames_centered >= FRAMES_TO_LOCK_CENTER and not person_centered:
-                                person_centered = True
-                                print("🎯 Person CENTERED and LOCKED!")
-                                print(f"   Holding position - person is in center zone")
-                        else:
-                            # Person moved out of center - reset
-                            if person_centered:
-                                print("⚠️  Person moved - resuming tracking")
-                                person_centered = False
-                            frames_centered = 0
-                        
-                        # Camera movement is ONLY triggered by movement detection
-                        # (handled above in activity_logger.detect_and_log_movement)
-                        # NO continuous position tracking to avoid pushing person out of frame
-                    
-                    # Draw tracking visualization
-                    cv2.rectangle(vis, (face.x1, face.y1), (face.x2, face.y2), (0, 255, 255), 3)
-                    for (x, y) in face.landmarks.astype(int):
-                        cv2.rectangle(vis, (int(x) - 3, int(y) - 3), (int(x) + 3, int(y) + 3), (0, 255, 255), 1)
-                    
-                    cv2.putText(
-                        vis, f"{display_name} ({best_dist:.3f})", (face.x1, max(0, face.y1 - 10)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2
-                    )
-                    
-                    # Draw confidence bar
-                    bar_w = 100
-                    bar_h = 20
-                    bar_x = face.x1
-                    bar_y = face.y1 - 35
-                    cv2.rectangle(vis, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), (200, 200, 200), 1)
-                    if accepted:
-                        filled_w = int(bar_w * confidence)
-                        cv2.rectangle(vis, (bar_x, bar_y), (bar_x + filled_w, bar_y + bar_h), (0, 255, 255), -1)
-                
-                elif accepted:
-                    cv2.putText(
-                        vis, display_name, (face.x1, max(0, face.y1 - 10)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2
-                    )
-                else:
-                    cv2.rectangle(vis, (face.x1, face.y1), (face.x2, face.y2), color, 2)
-                    cv2.putText(
-                        vis, display_name, (face.x1, max(0, face.y1 - 10)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2
-                    )
-            
-            # Draw tracking indicator
-            if locked_face_center and mqtt_controller and mqtt_controller.is_connected:
-                cx, cy = int(locked_face_center[0]), int(locked_face_center[1])
-                cv2.circle(vis, (cx, cy), 10, (0, 255, 255), 2)
-                cv2.line(vis, (cx - 15, cy), (cx + 15, cy), (0, 255, 255), 2)
-                cv2.line(vis, (cx, cy - 15), (cx, cy + 15), (0, 255, 255), 2)
-            
-            # Search mode: sweep camera when locked person not found
-            if lock_name and mqtt_controller and mqtt_controller.is_connected:
-                if locked_person_found:
-                    # Person found - reset search mode
-                    if search_mode:
-                        print("✓ Person found - stopping search")
-                        print("🎯 Centering on person...")
-                        search_mode = False
-                        search_sweep_index = 0  # Reset sweep index
-                        person_centered = False  # Reset centering state
-                        frames_centered = 0
-                    frames_without_person = 0
-                else:
-                    # Person not found - increment counter
-                    frames_without_person += 1
-                    person_centered = False  # Reset centering when person lost
-                    frames_centered = 0
-                    
-                    if frames_without_person >= FRAMES_BEFORE_SEARCH:
-                        if not search_mode:
-                            print("🔍 Person lost - starting search mode")
-                            print("📍 Starting full sweep from 0° to 180°...")
-                            search_mode = True
-                            search_sweep_index = 0
-                            # Move to first position
-                            mqtt_controller.move_to_angle(sweep_positions[search_sweep_index])
-                            print(f"→ Camera angle: {sweep_positions[search_sweep_index]}°")
-                            last_search_time = time.time()
-                        
-                        # Perform sweep at intervals
-                        current_time = time.time()
-                        if current_time - last_search_time >= SEARCH_INTERVAL:
-                            next_angle, search_sweep_index = mqtt_controller.search_sweep(search_sweep_index)
-                            last_search_time = current_time
-                            print(f"🔄 Searching... moving to {next_angle}°")
-            
-            # Display search mode indicator
-            if search_mode:
-                search_text = f"🔍 SEARCHING... ({frames_without_person} frames)"
-                cv2.putText(
-                    vis, search_text, (10, vis.shape[0] - 170),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2
-                )
-            
-            # Display centered indicator
-            if person_centered and locked_person_found:
-                centered_text = f"🎯 CENTERED & LOCKED ({frames_centered} frames)"
-                cv2.putText(
-                    vis, centered_text, (10, vis.shape[0] - 200),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2
-                )
-                # Draw center zone indicator
-                center_x = int(frame_width / 2)
-                zone_width = int(centering_tolerance)
-                cv2.rectangle(vis, 
-                             (center_x - zone_width, 0), 
-                             (center_x + zone_width, vis.shape[0]), 
-                             (0, 255, 0), 2)
-                cv2.putText(vis, "CENTER ZONE", (center_x - 60, 60),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-            elif locked_person_found and not person_centered:
-                # Show centering progress
-                centering_text = f"⏳ Centering... ({frames_centered}/{FRAMES_TO_LOCK_CENTER})"
-                cv2.putText(
-                    vis, centering_text, (10, vis.shape[0] - 200),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2
-                )
-            
-            # Header
-            lock_status = f"Lock: {lock_name}" if lock_name else "Lock: (none)"
-            mqtt_status = "📡 MQTT: ON" if (mqtt_controller and mqtt_controller.is_connected) else "📡 MQTT: OFF"
-            header = f"{lock_status} | {mqtt_status} | Thresh: {threshold:.2f} | IDs: {len(names)} | FPS: {fps:.1f}"
-            cv2.putText(
-                vis, header, (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2
+
+            # --- FPS counters ----------------------------------------------
+            now = time.time()
+            if now - t_loop >= 1.0:
+                track_fps = loop_count / (now - t_loop)
+                loop_count = 0
+                t_loop = now
+            if now - t_recog >= 1.0:
+                recog_fps = recog_events / (now - t_recog)
+                recog_events = 0
+                t_recog = now
+
+            # --- Render ----------------------------------------------------
+            vis = frame
+            draw_tracks(vis, visible, tracker.locked_track_id, searching=(state == "SEARCHING"))
+            if state == "SEARCHING" and lock_name:
+                _draw_search_banner(vis, lock_name)
+
+            servo_angle = f"{int(round(pan.current_angle))}" if mqtt else "-"
+            _draw_debug_overlay(
+                vis, state, lock_name, servo_angle, len(visible),
+                recog_fps, track_fps, bool(mqtt and mqtt.is_connected),
+                threshold, (time.time() - lost_since) if lost_since else 0.0,
             )
-            
-            # Action labels
-            y_action = 58
-            for label, _ in action_display:
-                cv2.putText(
-                    vis, label, (10, y_action),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2
-                )
-                y_action += 28
-            
-            # Activity statistics
-            if activity_logger:
-                stats = activity_logger.get_statistics()
-                y_stat = vis.shape[0] - 140
-                cv2.putText(
-                    vis, "Activity Log:", (10, y_stat),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2
-                )
-                y_stat += 22
-                cv2.putText(
-                    vis, f"Blinks: {stats['counts']['blink']}", (10, y_stat),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1
-                )
-                y_stat += 20
-                cv2.putText(
-                    vis, f"Smiles: {stats['counts']['smile']}", (10, y_stat),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1
-                )
-                y_stat += 20
-                cv2.putText(
-                    vis, f"Move L/R: {stats['counts']['move_left']}/{stats['counts']['move_right']}", (10, y_stat),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1
-                )
-            
-            # Camera servo status
-            if mqtt_controller and mqtt_controller.is_connected:
-                servo_status = mqtt_controller.get_status()
-                if servo_status:
-                    y_servo = vis.shape[0] - 40
-                    angle = servo_status.get('angle', '?')
-                    cv2.putText(
-                        vis, f"Servo: {angle}°", (10, y_servo),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2
-                    )
-            
-            # Controls hint
-            cv2.putText(
-                vis, "q=quit r=reload l=clear c=center s=search f=fullscreen +/-=threshold", (10, vis.shape[0] - 10),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1
-            )
-            
+
+            y_action = vis.shape[0] - 16 * len(action_display) - 8
+            for lbl, _ in action_display:
+                cv2.putText(vis, lbl, (vis.shape[1] - 160, y_action),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2, cv2.LINE_AA)
+                y_action += 18
+
             cv2.imshow(window_name, vis)
-            
+
+            # --- Keyboard --------------------------------------------------
             key = cv2.waitKey(1) & 0xFF
+            if not CameraStream.is_window_open(window_name):
+                print("\nDisplay window closed — exiting.")
+                break
             if key == ord("q"):
                 break
-            elif key == ord("r"):
+            if key == ord("r"):
                 db = load_database()
                 names = sorted(db.keys())
-                embeddings_matrix = np.stack([db[n].reshape(-1) for n in names], axis=0)
+                embeddings_matrix = np.stack([db[n].reshape(-1) for n in names], axis=0).astype(np.float32)
                 if lock_name and lock_name not in names:
                     lock_name = None
+                    tracker.release_lock()
+                    pan.reset()
                 print(f"✓ Reloaded {len(db)} identities")
             elif key == ord("l"):
                 if activity_logger:
                     activity_logger.save_summary()
                     activity_logger = None
                 lock_name = None
-                if mqtt_controller:
-                    mqtt_controller.center()
+                tracker.release_lock()
+                pan.reset()
+                lost_since = None
                 print("Lock cleared")
-            elif key == ord("c"):
-                if mqtt_controller and mqtt_controller.is_connected:
-                    mqtt_controller.center()
-                    search_mode = False
-                    frames_without_person = 0
-                    print("Camera centered")
+            elif key == ord("k"):
+                new_lock = choose_lock_identity(names)
+                if new_lock:
+                    lock_name = new_lock
+                    tracker.release_lock()
+                    pan.reset()
+                    if activity_logger is None:
+                        activity_logger = ActivityLogger(lock_name, config.HISTORY_DIR)
+                    print(f"Lock target set to {lock_name}")
             elif key == ord("s"):
-                # Toggle search mode manually
-                if mqtt_controller and mqtt_controller.is_connected:
-                    search_mode = not search_mode
-                    if search_mode:
-                        print("🔍 Search mode: ON (manual)")
-                        print("📍 Moving to start position (0°)...")
-                        # Start search from 0° (far left)
-                        mqtt_controller.move_to_angle(0)
-                        current_search_angle = 0
-                        frames_without_person = FRAMES_BEFORE_SEARCH
-                        last_search_time = time.time()
-                    else:
-                        print("⏸️  Search mode: OFF")
-                        frames_without_person = 0
-                        mqtt_controller.center()
+                pan.toggle_search()
+                print(f"Manual search: {'ON' if pan.search_manual else 'OFF'}")
+            elif key == ord("c"):
+                pan.force_center()
+                print("Camera centered")
             elif key == ord("f"):
-                is_fullscreen = not is_fullscreen
-                if is_fullscreen:
-                    cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
-                else:
-                    cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_NORMAL)
+                prop = cv2.WND_PROP_FULLSCREEN
+                cur = cv2.getWindowProperty(window_name, prop)
+                cv2.setWindowProperty(
+                    window_name, prop,
+                    cv2.WINDOW_FULLSCREEN if cur != cv2.WINDOW_FULLSCREEN else cv2.WINDOW_NORMAL,
+                )
             elif key in (ord("+"), ord("=")):
                 threshold = min(1.0, threshold + 0.01)
-                print(f"Threshold: {threshold:.2f}")
             elif key == ord("-"):
                 threshold = max(0.0, threshold - 0.01)
-                print(f"Threshold: {threshold:.2f}")
-    
+
     finally:
         if activity_logger:
             activity_logger.save_summary()
-        
-        if mqtt_controller:
-            mqtt_controller.center()  # Center camera before exit
-            mqtt_controller.disconnect()
-        
-        cap.release()
+        if mqtt:
+            mqtt.close()
+        detector.close()
+        cam.release()
         cv2.destroyAllWindows()
-    
-    print("✓ Recognition ended.")
+
+    print("✓ Tracking ended.")
     return True
 
 
 if __name__ == "__main__":
     import argparse
-    
-    parser = argparse.ArgumentParser(description="Live face recognition with MQTT camera tracking")
-    parser.add_argument("--fullscreen", "-f", action="store_true", help="Start in fullscreen mode")
-    parser.add_argument("--no-mqtt", action="store_true", help="Disable MQTT tracking")
-    parser.add_argument("--broker", default="localhost", help="MQTT broker hostname/IP")
-    parser.add_argument("--port", type=int, default=1883, help="MQTT broker port")
+
+    parser = argparse.ArgumentParser(description="Face recognition with MQTT camera tracking")
+    parser.add_argument("--fullscreen", "-f", action="store_true")
+    parser.add_argument("--no-mqtt", action="store_true", help="Disable MQTT servo control")
+    parser.add_argument("--broker", type=str, default=None, help="MQTT broker IP")
+    parser.add_argument("--port", type=int, default=None, help="MQTT broker port")
     args = parser.parse_args()
-    
-    success = main(
+
+    ok = main(
         start_fullscreen=args.fullscreen,
         enable_mqtt=not args.no_mqtt,
         mqtt_broker=args.broker,
-        mqtt_port=args.port
+        mqtt_port=args.port,
     )
-    sys.exit(0 if success else 1)
+    sys.exit(0 if ok else 1)
