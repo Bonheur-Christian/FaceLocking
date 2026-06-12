@@ -72,6 +72,7 @@ class PanTracker:
         self._sweep_stop = threading.Event()
         self._sweep_stop.set()          # Not sweeping at startup
         self._sweep_thread: Optional[threading.Thread] = None
+        self._sweep_from_zero: bool = True   # First sweep after reset() starts at 0°
 
     # ── properties ────────────────────────────────────────────────────────────
 
@@ -111,8 +112,21 @@ class PanTracker:
         self.frames_in_center = 0
         self.center_locked = False
         self.search_manual = False
+        self._sweep_from_zero = True   # Next search sweep begins at 0°
 
     # ── SEARCH — background thread ─────────────────────────────────────────
+
+    def hold(self, reason: str = "target spotted") -> Tuple[str, None]:
+        """Stop search sweep and freeze the servo at the current position."""
+        self._stop_sweep()
+        if self.mqtt:
+            self.mqtt.stop_search()
+        self._holding = True
+        self.target_angle = float(self.current_angle)
+        self._smooth_angle = float(self.current_angle)
+        if self.log:
+            self.log.servo_hold(self.current_angle, reason)
+        return ("holding", None)
 
     def search(self) -> Tuple[str, Optional[int]]:
         """
@@ -173,12 +187,18 @@ class PanTracker:
         step_deg = max(1, int(config.SEARCH_STEP))          # degrees per step
         step_sec = max(0.005, float(config.SEARCH_UPDATE_INTERVAL))  # seconds
 
-        # ── Go to 0° first, as required ───────────────────────────────────
-        if self.mqtt and self.mqtt.is_connected:
-            self.mqtt.move_to_angle(lo)
-
-        pos = float(lo)
-        direction = 1   # +1 → sweeping toward hi, -1 → sweeping toward lo
+        if self._sweep_from_zero:
+            # Fresh loss after confirmed track — sweep from 0° as designed.
+            if self.mqtt and self.mqtt.is_connected:
+                self.mqtt.sweep_move(lo)
+            pos = float(lo)
+            direction = 1
+            self._sweep_from_zero = False
+        else:
+            # Sweep thread restarted (e.g. brief track() flicker) — continue
+            # from current angle so rotation never pauses or jumps backward.
+            pos = _clamp(float(self.current_angle), lo, hi)
+            direction = 1 if pos <= (lo + hi) / 2.0 else -1
 
         while not self._sweep_stop.is_set():
             # Advance position.
@@ -215,6 +235,8 @@ class PanTracker:
         # First call with a confirmed target: stop the sweep.
         if self.is_searching:
             self._stop_sweep()
+            if self.mqtt:
+                self.mqtt.stop_search()
             # Seed PID from current physical position to avoid a jump.
             self.target_angle = float(self.current_angle)
             self._smooth_angle = float(self.current_angle)

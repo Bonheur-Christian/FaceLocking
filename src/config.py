@@ -119,7 +119,7 @@ RECOGNITION_BLUR_MIN_VAR = 25.0
 # RECOGNITION & THRESHOLD SETTINGS
 # ============================================================================
 
-DEFAULT_DISTANCE_THRESHOLD = 0.52  # Cosine distance; lower = stricter / more accurate
+DEFAULT_DISTANCE_THRESHOLD = 0.45  # Cosine distance; lower = stricter / more accurate
 SIMILARITY_THRESHOLD = 0.70  # 1 - distance_threshold (for reference)
 TARGET_FAR = 0.01  # 1% False Accept Rate for threshold tuning
 THRESHOLD_SWEEP_RANGE = (0.10, 1.20, 0.01)  # (start, end, step)
@@ -283,7 +283,7 @@ SERVO_DEAD_ZONE_NORMALIZED = 0.06  # Legacy normalized fallback
 # ----------------------------------------------------------------------------
 ENABLE_AUTO_CENTERING = True  # Continuous pan to keep locked face centered
 CENTERING_TOLERANCE = 0.08    # Normalized half-width counted as "centered" (was 0.10)
-FRAMES_TO_LOCK_CENTER = 6     # Frames inside center zone before "centered" state (was 8)
+FRAMES_TO_LOCK_CENTER = 1   # Frames inside center zone before "centered" state (was 8)
 
 # Legacy step-based mode (kept for compatibility; PID path is preferred)
 MOVEMENT_BASED_TRACKING = False
@@ -294,9 +294,9 @@ TRACKING_MOVEMENT_THRESHOLD = 0.05
 # LOST-TARGET SEARCH & REACQUISITION (Issues #4, #5)
 # ----------------------------------------------------------------------------
 LOST_TARGET_TIMEOUT = 0.0        # Enter SEARCH immediately when target leaves frame (no servo freeze)
-LOST_TARGET_FRAMES = 4           # Frames a track may be missing before it is dropped
+LOST_TARGET_FRAMES = 1        # Drop stale track quickly → enter search sooner
 # If locked track stays visible but is unrecognized for this long → treat as lost
-LOST_TARGET_UNRECOGNIZED_SEC = 1.5
+LOST_TARGET_UNRECOGNIZED_SEC = 0.5
 
 # Search sweep — full 0°–180° coverage, CONTINUOUS, never pausing.
 #
@@ -326,7 +326,7 @@ SEARCH_SWEEP_SPEED = SEARCH_SPEED
 SEARCH_SWEEP_STEP = SEARCH_STEP
 SEARCH_PC_SWEEP_STEP = SEARCH_STEP
 
-SEARCH_REACQUIRE_FRAMES = 2      # Confirmed frames before re-locking
+SEARCH_REACQUIRE_FRAMES = 1      # Bind immediately when target reappears during search
 SEARCH_ENDPOINT_DWELL_SEC = 0.0  # NEVER dwell at edges — reversal is instant
 # Kept for backward compatibility only (not used by the thread-based sweep)
 SEARCH_CMD_RESEND_SEC = 1.0
@@ -336,8 +336,8 @@ SEARCH_START_DIRECTION = "last"
 SEARCH_EXPAND_ENABLED = False
 
 # Legacy fixed sweep (used only if SEARCH_EXPAND_ENABLED is False)
-FRAMES_BEFORE_SEARCH = 24
-SEARCH_INTERVAL_SEC = 0.15
+FRAMES_BEFORE_SEARCH = 2
+SEARCH_INTERVAL_SEC = 0.05
 SEARCH_SWEEP_POSITIONS = [
     0, 15, 30, 45, 60, 75, 90, 105, 120, 135, 150, 165, 180,
     165, 150, 135, 120, 105, 90, 75, 60, 45, 30, 15, 0,

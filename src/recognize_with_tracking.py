@@ -57,6 +57,55 @@ from .dashboard_state import DashboardState, faces_from_tracks
 from .dashboard_server import get_state, start_dashboard_server
 
 
+def _find_spotted_target(lock_name: str, visible) -> Optional[object]:
+    """Best visible track that matches the locked identity."""
+    best = None
+    for tr in visible:
+        if tr.accepted and tr.name == lock_name and tr.misses == 0:
+            if best is None or tr.best_dist < best.best_dist:
+                best = tr
+    return best
+
+
+def _in_search_mode(
+    lock_name: Optional[str],
+    state: str,
+    lost_since: Optional[float],
+) -> bool:
+    """True while the servo should keep sweeping (only locked_confirmed may exit)."""
+    return bool(
+        lock_name
+        and (
+            lost_since is not None
+            or state in ("SEARCHING", "LOST_TARGET", "REACQUIRING")
+        )
+    )
+
+
+def _activate_search(
+    pan: PanTracker,
+    tlog: TrackingLogger,
+    lock_name: str,
+    state: str,
+    lost_since: Optional[float],
+    *,
+    display_state: Optional[str] = None,
+) -> Tuple[str, float]:
+    """Start or continue autonomous sweep; log once on first entry."""
+    now = time.time()
+    if lost_since is None:
+        lost_since = now
+    if state not in ("SEARCHING", "LOST_TARGET", "REACQUIRING"):
+        direction = (
+            "right" if pan.last_error_sign > 0
+            else "left" if pan.last_error_sign < 0
+            else "center"
+        )
+        tlog.search_started(lock_name, pan.last_known_angle, direction)
+    pan.search()
+    return display_state or "SEARCHING", lost_since
+
+
 def _draw_debug_overlay(
     vis: np.ndarray,
     state: str,
@@ -249,12 +298,8 @@ def main(
             loop_count += 1
             frame_w = frame.shape[1]
 
-            # --- Detect + associate (every frame when faces/search active) ---
-            search_active = (
-                lock_name
-                and lost_since is not None
-                and (time.time() - lost_since) >= config.LOST_TARGET_TIMEOUT
-            )
+            # --- Detect + associate (every frame while searching for lock) ---
+            search_active = _in_search_mode(lock_name, state, lost_since) or pan.is_searching
             tracking_active = (
                 bool(tracker.visible_tracks())
                 or tracker.locked_track_id is not None
@@ -262,7 +307,10 @@ def main(
                 or search_active
                 or pan.search_manual
             )
-            if tracking_active:
+            if search_active:
+                # Full-rate detection while sweeping — faster reacquire.
+                run_detect = True
+            elif tracking_active:
                 run_detect = frame_idx % config.DETECT_EVERY_N_FRAMES_FACE == 0
             else:
                 run_detect = frame_idx % config.DETECT_EVERY_N_FRAMES_IDLE == 0
@@ -301,42 +349,41 @@ def main(
                     recog_events += 1
                     budget -= 1
 
-            # --- Lock acquisition / reacquisition (new track ID after search) -
-            pending_candidate = None
-            if lock_name and tracker.locked_track_id is None:
-                candidate = None
-                for tr in visible:
-                    if tr.accepted and tr.name == lock_name:
-                        if candidate is None or tr.best_dist < candidate.best_dist:
-                            candidate = tr
-                pending_candidate = candidate
-                if candidate is not None:
-                    if reacquire_track_id == candidate.track_id:
-                        reacquire_frame_count += 1
-                    else:
-                        reacquire_track_id = candidate.track_id
-                        reacquire_frame_count = 1
-                    # First lock at session start: 1 frame; after search loss: hysteresis.
-                    need_frames = (
-                        1
-                        if lost_since is None and prev_locked_track_id is None
-                        else config.SEARCH_REACQUIRE_FRAMES
-                    )
-                    if reacquire_frame_count >= need_frames:
-                        tracker.locked_track_id = candidate.track_id
-                        pan.reset()
-                        locked_unrecog_since = None
-                        reacquire_track_id = None
-                        reacquire_frame_count = 0
-                        state = "REACQUIRING"
-                        tlog.target_reacquiring(
-                            lock_name, candidate.track_id,
-                            candidate.center, candidate.confidence, pan.current_angle,
-                        )
-                        print(f"✓ Re-locked onto {lock_name} (track #{candidate.track_id})")
+            # --- Lock acquisition / reacquisition ----------------------------
+            spotted = _find_spotted_target(lock_name, visible) if lock_name else None
+            if lock_name and spotted is not None:
+                # Stop search rotation immediately — do not wait for reacquire count.
+                if lost_since is not None or pan.is_searching:
+                    pan.hold("target spotted during search")
+
+                if reacquire_track_id == spotted.track_id:
+                    reacquire_frame_count += 1
                 else:
+                    reacquire_track_id = spotted.track_id
+                    reacquire_frame_count = 1
+
+                # During search: bind on first sight. At session start: 1 frame.
+                need_frames = (
+                    1
+                    if lost_since is not None or prev_locked_track_id is None
+                    else config.SEARCH_REACQUIRE_FRAMES
+                )
+                if reacquire_frame_count >= need_frames:
+                    if tracker.locked_track_id != spotted.track_id:
+                        tracker.locked_track_id = spotted.track_id
+                        if lost_since is None:
+                            pan.reset()
+                        locked_unrecog_since = None
+                        tlog.target_reacquiring(
+                            lock_name, spotted.track_id,
+                            spotted.center, spotted.confidence, pan.current_angle,
+                        )
+                        print(f"✓ Re-locked onto {lock_name} (track #{spotted.track_id})")
                     reacquire_track_id = None
                     reacquire_frame_count = 0
+            elif lock_name:
+                reacquire_track_id = None
+                reacquire_frame_count = 0
 
             locked = tracker.locked_track
 
@@ -357,7 +404,7 @@ def main(
                 tlog.idle()
 
             elif locked_confirmed:
-                # ── Target is visible AND recognised ──────────────────────
+                # ── ONLY branch that stops continuous search rotation ─────
                 if state in ("SEARCHING", "LOST_TARGET", "REACQUIRING") or (
                     prev_locked_track_id is None and lost_since is not None
                 ) or prev_locked_track_id != locked.track_id:
@@ -373,69 +420,62 @@ def main(
                 label, _ = pan.track(locked.center[0], frame_w)
                 state = "LOCKED" if label == "centered" else "TRACKING"
 
+            elif spotted is not None and _in_search_mode(lock_name, state, lost_since):
+                # ── Target seen while searching — hold motor, finish re-bind ─
+                pan.hold("target spotted during search")
+                locked_unrecog_since = None
+                state = "REACQUIRING"
+
+            elif _in_search_mode(lock_name, state, lost_since):
+                # ── No sighting yet — keep sweeping ─────────────────────────
+                locked_unrecog_since = None
+                state, lost_since = _activate_search(
+                    pan, tlog, lock_name, state, lost_since,
+                )
+
             elif locked is not None and not locked_visible:
-                # ── Stale / occluded track (misses > 0) — do NOT chase ghost ─
+                # ── Stale / occluded track (misses > 0) — do NOT chase ghost
                 locked_unrecog_since = None
                 if lost_since is None:
                     lost_since = time.time()
+                    prev_locked_track_id = None
+                    tracker.release_lock()
                     tlog.target_lost(lock_name)
-                if state not in ("SEARCHING", "LOST_TARGET"):
-                    direction = (
-                        "right" if pan.last_error_sign > 0
-                        else "left" if pan.last_error_sign < 0
-                        else "center"
-                    )
-                    tlog.search_started(lock_name, pan.last_known_angle, direction)
-                state = "SEARCHING"
-                pan.search()
+                state, lost_since = _activate_search(
+                    pan, tlog, lock_name, state, lost_since,
+                )
 
             elif locked is not None and not locked_confirmed:
-                # ── Track exists but identity not yet confirmed ───────────
-                # Could be: (a) new track not yet embedded, (b) person stepped
-                # back and recognition degraded.  Give it LOST_TARGET_UNRECOGNIZED_SEC
-                # then escalate to search.
+                # ── Track visible but identity not confirmed (not searching)
                 if locked_unrecog_since is None:
                     locked_unrecog_since = time.time()
                 unrecog_for = time.time() - locked_unrecog_since
 
                 if unrecog_for < config.LOST_TARGET_UNRECOGNIZED_SEC:
-                    # Tentative: keep servo following the track while hoping
-                    # recognition recovers.  State shown as TRACKING (yellow).
                     pan.track(locked.center[0], frame_w)
                     state = "TRACKING"
                     tlog.target_still_missing(lock_name, unrecog_for)
                 else:
-                    # Recognition failed too long — enter search immediately.
                     if lost_since is None:
                         lost_since = time.time()
                         prev_locked_track_id = None
+                        tracker.release_lock()
                         tlog.target_lost(lock_name)
-                    if state not in ("SEARCHING", "LOST_TARGET"):
-                        direction = (
-                            "right" if pan.last_error_sign > 0
-                            else "left" if pan.last_error_sign < 0
-                            else "center"
-                        )
-                        tlog.search_started(lock_name, pan.last_known_angle, direction)
-                    state = "SEARCHING"
-                    pan.search()
+                    state, lost_since = _activate_search(
+                        pan, tlog, lock_name, state, lost_since,
+                    )
 
             else:
-                # ── Track gone (deleted) — search immediately, no servo freeze
+                # ── No locked track — sweep immediately
                 locked_unrecog_since = None
                 if lost_since is None:
                     lost_since = time.time()
                     prev_locked_track_id = None
+                    tracker.release_lock()
                     tlog.target_lost(lock_name)
-                if state not in ("SEARCHING", "LOST_TARGET"):
-                    direction = (
-                        "right" if pan.last_error_sign > 0
-                        else "left" if pan.last_error_sign < 0
-                        else "center"
-                    )
-                    tlog.search_started(lock_name, pan.last_known_angle, direction)
-                state = "SEARCHING"
-                pan.search()
+                state, lost_since = _activate_search(
+                    pan, tlog, lock_name, state, lost_since,
+                )
 
             # --- Activity logging for the locked, visible target -----------
             if (
