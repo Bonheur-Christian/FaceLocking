@@ -120,7 +120,6 @@ class PanTracker:
         self.search_manual = False
         self._sweep_from_zero = True   # Next search sweep begins at 0°
         self._search_cancelled = False
-        self._search_cancelled = False
 
     # ── SEARCH — background thread ─────────────────────────────────────────
 
@@ -133,12 +132,19 @@ class PanTracker:
         stale waypoints cannot keep the servo moving.
         """
         self._search_cancelled = True
+        self.search_manual = False
         self._stop_sweep()
         hold_angle = int(round(self.current_angle))
         self.target_angle = float(hold_angle)
         self._smooth_angle = float(hold_angle)
         self.smoothed_error = None
         self.prev_error = 0.0
+        # Clear stale holding/centering state so the FIRST track() after
+        # acquisition re-evaluates the dead-band from scratch: it will move to
+        # centre if the face is off-centre, or hold if already centred.
+        self._holding = False
+        self.frames_in_center = 0
+        self.center_locked = False
         if self.mqtt:
             self.mqtt.cancel_search(hold_angle)
         if self.log:
@@ -392,3 +398,19 @@ class PanTracker:
         self._smooth_angle = float(config.SERVO_CENTER_ANGLE)
         if self.mqtt:
             self.mqtt.center()
+
+    def shutdown(self) -> None:
+        """
+        Stop ALL servo motion on program exit.
+
+        Halts the background sweep thread and commands the ESP to leave
+        search mode and hold its current angle, so the camera does not keep
+        sweeping after the tracking process is stopped.
+        """
+        self._search_cancelled = True
+        self.search_manual = False
+        self._stop_sweep()
+        if self.mqtt:
+            hold_angle = int(round(self.current_angle))
+            self.mqtt.cancel_search(hold_angle)
+            self.mqtt.go_idle(hold_angle)

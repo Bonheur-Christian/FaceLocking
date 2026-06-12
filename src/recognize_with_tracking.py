@@ -394,6 +394,10 @@ def main(
                 lost_since = None
                 locked_unrecog_since = None
                 prev_locked_track_id = None
+                # No lock target → camera must be completely still. Stop any
+                # sweep that was running before the lock was cleared.
+                if pan.is_searching or pan.search_manual:
+                    pan.cancel_search("no lock — camera idle")
                 tlog.idle()
 
             elif locked_confirmed:
@@ -612,6 +616,12 @@ def main(
                 threshold = max(0.0, threshold - 0.01)
 
     finally:
+        # Stop ALL servo motion FIRST so the camera does not keep sweeping
+        # after the tracking process is stopped (q / Ctrl-C / window close).
+        try:
+            pan.shutdown()
+        except Exception as exc:
+            print(f"⚠ Servo shutdown error: {exc}")
         if activity_logger:
             activity_logger.save_summary()
         if mqtt:

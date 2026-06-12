@@ -241,6 +241,31 @@ class MQTTCameraController:
                 self._last_publish_ms = time.time() * 1000.0
             return ok
 
+    def go_idle(self, hold_angle: Optional[int] = None) -> bool:
+        """
+        Park the servo: leave search/track, hold the current angle, and stop
+        all motion. Sent on shutdown so the camera does not keep moving.
+        """
+        self._search_requested = False
+        if not self.is_connected:
+            return False
+        angle = hold_angle if hold_angle is not None else self.reported_angle
+        angle = int(max(config.SERVO_MIN_ANGLE, min(config.SERVO_MAX_ANGLE, angle)))
+        with self._publish_lock:
+            # "track" works on all firmware (stops sweep); "idle" parks on
+            # firmware that supports a dedicated IDLE state. Both are harmless.
+            self.client.publish(self.topic_command, "track", qos=config.MQTT_QOS)
+            self.client.publish(self.topic_horizontal, str(angle), qos=config.MQTT_QOS)
+            self.client.publish(self.topic_command, "idle", qos=config.MQTT_QOS)
+            self.commanded_angle = angle
+        return True
+
+    def flush(self, timeout_sec: float = 0.5) -> None:
+        """Give the network loop time to deliver queued publishes."""
+        deadline = time.time() + timeout_sec
+        while time.time() < deadline:
+            time.sleep(0.02)
+
     def move_left(self, step: int = None) -> bool:
         step = step or config.SERVO_STEP_SIZE
         # Use commanded_angle (last sent) — reported_angle lags ESP status by ~250ms.
@@ -264,6 +289,10 @@ class MQTTCameraController:
 
     def close(self) -> None:
         try:
+            # Final safety stop: ensure the ESP is parked and the command is
+            # flushed before we tear down the network loop.
+            self.go_idle()
+            self.flush(0.4)
             self.client.loop_stop()
             self.client.disconnect()
         except Exception:
