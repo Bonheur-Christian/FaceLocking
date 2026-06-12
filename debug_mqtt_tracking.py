@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Monitor MQTT camera tracking topics."""
 
+import utils.transport
+import utils.session
 import json
 import sys
 
