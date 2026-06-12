@@ -3,6 +3,7 @@ MQTT camera controller — publishes pan commands to ESP8266 servo firmware.
 """
 
 import json
+import threading
 import time
 from typing import Optional
 
@@ -30,10 +31,24 @@ class MQTTCameraController:
         self.topic_command = config.MQTT_TOPIC_COMMAND
         self.topic_status = config.MQTT_TOPIC_STATUS
 
-        self.current_angle = config.SERVO_CENTER_ANGLE
+        # reported_angle: last value from ESP status (physical position)
+        # commanded_angle: last angle successfully published (avoid duplicate sends)
+        self.reported_angle = config.SERVO_CENTER_ANGLE
+        self.commanded_angle = config.SERVO_CENTER_ANGLE
         self.is_connected = False
         self.last_status: dict = {}
         self._last_publish_ms = 0.0
+        self._last_status_time = 0.0
+
+        # Servo mode mirror.  The ESP runs an autonomous sweep in "search" mode;
+        # the PC only needs to send the mode-change command ONCE (with periodic
+        # re-assertion in case a packet is dropped) instead of streaming
+        # waypoints.  This keeps MQTT traffic minimal and the sweep perfectly
+        # smooth because motion is generated on the ESP, not over the network.
+        self.reported_mode: str = "track"
+        self._search_requested = False
+        self._last_search_cmd_ms = 0.0
+        self._publish_lock = threading.Lock()
 
         self.client = mqtt.Client(
             mqtt.CallbackAPIVersion.VERSION2,
@@ -62,10 +77,15 @@ class MQTTCameraController:
         else:
             print(f"✗ MQTT connect failed rc={rc}")
 
-    def _on_disconnect(self, client, userdata, rc, properties=None):
+    def _on_disconnect(self, client, userdata, *args):
+        # paho VERSION2 calls: (client, userdata, disconnect_flags, reason_code,
+        # properties). Older/other versions pass (client, userdata, rc). Accept
+        # *args so a signature mismatch can never crash the network loop thread
+        # (which would silently stop all publishes and status updates).
         self.is_connected = False
-        if rc != 0:
-            print(f"⚠ MQTT disconnected rc={rc}")
+        self.reported_mode = "track"  # don't assume ESP is still sweeping
+        reason = args[-2] if len(args) >= 2 else (args[0] if args else "?")
+        print(f"⚠ MQTT disconnected (reason={reason}) — auto-reconnecting...")
 
     def _on_message(self, client, userdata, msg):
         if msg.topic != self.topic_status:
@@ -78,9 +98,18 @@ class MQTTCameraController:
                 self.last_status = {"raw": payload}
             angle = self.last_status.get("angle")
             if angle is not None:
-                self.current_angle = int(angle)
+                self.reported_angle = int(angle)
+                self._last_status_time = time.time()
+            mode = self.last_status.get("mode")
+            if mode is not None:
+                self.reported_mode = str(mode)
         except Exception:
             pass
+
+    @property
+    def current_angle(self) -> int:
+        """Best estimate of physical servo angle (ESP status when available)."""
+        return self.reported_angle
 
     def _rate_limited(self) -> bool:
         now = time.time() * 1000.0
@@ -97,27 +126,87 @@ class MQTTCameraController:
         result = self.client.publish(topic, payload, qos=config.MQTT_QOS)
         return result.rc == mqtt.MQTT_ERR_SUCCESS
 
-    def move_to_angle(self, angle: int) -> bool:
+    def move_to_angle(self, angle: int, force: bool = False) -> bool:
+        """
+        Rate-limited angle publish for the tracking thread.
+
+        Dedup skips identical commanded angles UNLESS *force* is True or the
+        ESP-reported position still differs (command was sent but servo has
+        not caught up yet).
+        """
         angle = int(max(config.SERVO_MIN_ANGLE, min(config.SERVO_MAX_ANGLE, angle)))
-        # Only skip moves that are genuinely zero change — don't suppress 1° steps,
-        # as they are the result of smooth output-angle EMA from PanTracker.
-        if angle == int(self.current_angle):
+        with self._publish_lock:
+            if not force and angle == self.commanded_angle:
+                if abs(angle - self.reported_angle) <= 2:
+                    return False
+            ok = self._publish(self.topic_horizontal, str(angle))
+            if ok:
+                self.commanded_angle = angle
+            return ok
+
+    def sweep_move(self, angle: int) -> bool:
+        """
+        Direct angle publish for the background sweep thread.
+
+        Bypasses the tracking rate limiter; sweep timing is controlled by the
+        thread's own sleep interval. Serialized via _publish_lock so tracking
+        and search never publish simultaneously.
+        """
+        angle = int(max(config.SERVO_MIN_ANGLE, min(config.SERVO_MAX_ANGLE, angle)))
+        if not self.is_connected:
             return False
-        ok = self._publish(self.topic_horizontal, str(angle))
-        if ok:
-            self.current_angle = angle
-        return ok
+        with self._publish_lock:
+            result = self.client.publish(self.topic_horizontal, str(angle), qos=0)
+            ok = result.rc == mqtt.MQTT_ERR_SUCCESS
+            if ok:
+                self.commanded_angle = angle
+            return ok
 
     def send_command(self, command: str) -> bool:
         return self._publish(self.topic_command, command)
 
+    def start_search(self) -> bool:
+        """
+        Ask the ESP to run its autonomous continuous sweep.
+
+        Idempotent: the command is sent once when search begins and then
+        re-asserted at most every SEARCH_CMD_RESEND_SEC so a dropped packet
+        cannot leave the servo frozen.  The actual 0->180->0 motion is
+        generated on the ESP, independent of MQTT timing.
+        """
+        if not self.is_connected:
+            return False
+        now = time.time()
+        # Pure time-based throttle: re-assert "search" at most every
+        # SEARCH_CMD_RESEND_SEC. We do NOT gate on reported mode, because a
+        # firmware that does not echo {"mode":...} would otherwise make us
+        # republish (and log) every single frame.
+        if self._search_requested and (now - self._last_search_cmd_ms) < config.SEARCH_CMD_RESEND_SEC:
+            return False
+        # Publish directly (do not use angle rate-limiter / dedup path).
+        result = self.client.publish(self.topic_command, "search", qos=config.MQTT_QOS)
+        ok = result.rc == mqtt.MQTT_ERR_SUCCESS
+        if ok:
+            self._search_requested = True
+            self._last_search_cmd_ms = now
+        return ok
+
+    def stop_search(self) -> bool:
+        """Stop the ESP sweep and hold the current position (TRACK mode)."""
+        self._search_requested = False
+        if not self.is_connected:
+            return False
+        result = self.client.publish(self.topic_command, "track", qos=config.MQTT_QOS)
+        return result.rc == mqtt.MQTT_ERR_SUCCESS
+
     def move_left(self, step: int = None) -> bool:
         step = step or config.SERVO_STEP_SIZE
-        return self.move_to_angle(self.current_angle - step)
+        # Use commanded_angle (last sent) — reported_angle lags ESP status by ~250ms.
+        return self.move_to_angle(self.commanded_angle - step)
 
     def move_right(self, step: int = None) -> bool:
         step = step or config.SERVO_STEP_SIZE
-        return self.move_to_angle(self.current_angle + step)
+        return self.move_to_angle(self.commanded_angle + step)
 
     def center(self) -> bool:
         return self.move_to_angle(config.SERVO_CENTER_ANGLE)

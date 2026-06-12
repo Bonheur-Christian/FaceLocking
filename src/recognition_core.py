@@ -32,11 +32,83 @@ class FaceResult:
 
 
 def load_database() -> Dict[str, np.ndarray]:
+    """
+    Load the face database.
+
+    Each identity maps to a (N, 512) matrix of L2-normalized enrollment
+    embeddings. Legacy databases that stored a single (512,) mean template are
+    transparently reshaped to (1, 512) so old enrollments keep working.
+    """
     if not config.DB_NPZ_PATH.exists():
         print("ERROR: Database not found. Run enrollment first.")
         return {}
     data = np.load(str(config.DB_NPZ_PATH), allow_pickle=True)
-    return {k: data[k].astype(np.float32) for k in data.files}
+    db: Dict[str, np.ndarray] = {}
+    for k in data.files:
+        arr = data[k].astype(np.float32)
+        if arr.ndim == 1:
+            arr = arr.reshape(1, -1)
+        db[k] = arr
+    return db
+
+
+def build_gallery(
+    db: Dict[str, np.ndarray], names: List[str]
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Flatten the per-person embedding matrices into one gallery for fast,
+    vectorized matching.
+
+    Returns
+    -------
+    gallery : (M, 512) float32 — every stored embedding across all people.
+    owner   : (M,)   int32     — index into `names` for each gallery row.
+    """
+    embs: List[np.ndarray] = []
+    owner: List[int] = []
+    for pi, name in enumerate(names):
+        mat = db[name]
+        if mat.ndim == 1:
+            mat = mat.reshape(1, -1)
+        for row in mat:
+            embs.append(row.astype(np.float32))
+            owner.append(pi)
+    if not embs:
+        return (
+            np.zeros((0, config.EMBEDDING_DIM), dtype=np.float32),
+            np.zeros((0,), dtype=np.int32),
+        )
+    return np.stack(embs, axis=0).astype(np.float32), np.asarray(owner, dtype=np.int32)
+
+
+def per_person_distance(
+    query_emb: np.ndarray,
+    gallery: np.ndarray,
+    owner: np.ndarray,
+    n_people: int,
+    topk: int = None,
+) -> np.ndarray:
+    """
+    Cosine distance from `query_emb` to each person, aggregated as the MEAN of
+    that person's TOP-K nearest stored embeddings. Robust to pose variation and
+    to a single bad enrollment sample.
+
+    Returns a (n_people,) array of distances (np.inf for people with no rows).
+    """
+    if topk is None:
+        topk = config.RECOGNITION_TOPK
+    out = np.full((n_people,), np.inf, dtype=np.float32)
+    if gallery.shape[0] == 0:
+        return out
+    dists = 1.0 - (gallery @ query_emb.reshape(-1))  # (M,)
+    for pi in range(n_people):
+        mask = owner == pi
+        if not np.any(mask):
+            continue
+        pd = dists[mask]
+        k = min(topk, pd.shape[0])
+        out[pi] = float(np.mean(np.sort(pd)[:k]))
+    return out
 
 
 def choose_lock_identity(names: list) -> Optional[str]:
@@ -52,8 +124,10 @@ def choose_lock_identity(names: list) -> Optional[str]:
         return None
     if not raw:
         return None
-    if raw.isdigit():
-        idx = int(raw)
+    # Accept "1", "1\", etc. — terminal paste sometimes adds stray chars.
+    digits = "".join(c for c in raw if c.isdigit())
+    if digits:
+        idx = int(digits)
         if 1 <= idx <= len(names):
             return names[idx - 1]
         return None
@@ -107,7 +181,8 @@ def process_faces(
     faces: List[FaceDetection],
     aligner: FaceAligner,
     embedder: ArcFaceEmbedder,
-    embeddings_matrix: np.ndarray,
+    gallery: np.ndarray,
+    owner: np.ndarray,
     names: List[str],
     threshold: float,
     lock_name: Optional[str],
@@ -121,12 +196,13 @@ def process_faces(
         aligned_faces.append(aligned)
 
     query_embs = embedder.embed_batch(aligned_faces)
-    dists_all = 1.0 - (query_embs @ embeddings_matrix.T)
+    n_people = len(names)
 
     results: List[FaceResult] = []
     for i, face in enumerate(faces):
-        best_idx = int(np.argmin(dists_all[i]))
-        best_dist = float(dists_all[i, best_idx])
+        pdist = per_person_distance(query_embs[i], gallery, owner, n_people)
+        best_idx = int(np.argmin(pdist))
+        best_dist = float(pdist[best_idx])
         best_match_name = names[best_idx]
 
         if best_dist <= threshold:
@@ -143,7 +219,6 @@ def process_faces(
             name, display_name, accepted, confidence, is_locked = (
                 "Unknown", "Unknown", False, 0.0, False
             )
-            best_dist = float(dists_all[i, best_idx])
 
         results.append(
             FaceResult(
@@ -164,16 +239,29 @@ def recognize_face(
     landmarks: np.ndarray,
     aligner: FaceAligner,
     embedder: ArcFaceEmbedder,
-    embeddings_matrix: np.ndarray,
+    gallery: np.ndarray,
+    owner: np.ndarray,
     names: List[str],
     threshold: float,
 ) -> Tuple[str, float, bool]:
-    """Align + embed + match a single face. Returns (name, best_dist, accepted)."""
+    """
+    Align + embed + match a single face against the multi-embedding gallery.
+
+    Per-person distance is the mean of the TOP-K nearest stored embeddings
+    (config.RECOGNITION_TOPK). Returns (name, best_dist, accepted).
+    """
+    from .quality import is_sharp_enough_for_recognition
+
     aligned, _ = aligner.align(frame, landmarks)
+    # Reject clearly-blurry faces — feeds an "Unknown" vote into the temporal
+    # stabiliser rather than a noisy (possibly wrong) identity.
+    if not is_sharp_enough_for_recognition(aligned):
+        return "Unknown", 1.0, False
+
     query_emb, _ = embedder.embed(aligned)
-    dists = 1.0 - (embeddings_matrix @ query_emb.reshape(-1))
-    best_idx = int(np.argmin(dists))
-    best_dist = float(dists[best_idx])
+    pdist = per_person_distance(query_emb, gallery, owner, len(names))
+    best_idx = int(np.argmin(pdist))
+    best_dist = float(pdist[best_idx])
     if best_dist <= threshold:
         return names[best_idx], best_dist, True
     return "Unknown", best_dist, False

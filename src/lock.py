@@ -18,11 +18,24 @@ from . import actions as action_module
 
 
 def load_database():
-    """Load enrolled face database."""
+    """Load enrolled face database as {name: (N, 512)}."""
     if not config.DB_NPZ_PATH.exists():
         return {}
     data = np.load(str(config.DB_NPZ_PATH), allow_pickle=True)
-    return {k: data[k].astype(np.float32) for k in data.files}
+    db = {}
+    for k in data.files:
+        arr = data[k].astype(np.float32)
+        if arr.ndim == 1:
+            arr = arr.reshape(1, -1)
+        db[k] = arr
+    return db
+
+
+def _mean_template(mat: np.ndarray) -> np.ndarray:
+    """Collapse a person's (N, 512) embeddings to a single normalized vector."""
+    mat = mat.reshape(-1, mat.shape[-1]).astype(np.float32)
+    mean = mat.mean(axis=0)
+    return (mean / (np.linalg.norm(mean) + 1e-12)).astype(np.float32)
 
 
 def cosine_distance(a, b):
@@ -105,7 +118,7 @@ def main():
     detector = HaarMediaPipeFaceDetector(min_size=config.HAAR_MIN_SIZE)
     aligner = FaceAligner()
     embedder = ArcFaceEmbedder(config.ARCFACE_MODEL_PATH)
-    embeddings_matrix = np.stack([db[n].reshape(-1) for n in names], axis=0)
+    embeddings_matrix = np.stack([_mean_template(db[n]) for n in names], axis=0)
     lock_idx = names.index(lock_identity)
     threshold = config.DEFAULT_DISTANCE_THRESHOLD
 

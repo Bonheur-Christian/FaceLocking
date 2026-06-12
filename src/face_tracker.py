@@ -89,7 +89,13 @@ class Track:
         self.last_seen_frame = frame_idx
 
     def apply_recognition(self, name: str, best_dist: float, accepted: bool, frame_idx: int) -> None:
-        """Fold a fresh recognition result into the stabilized cache."""
+        """
+        Fold a fresh recognition result into the stabilized cache.
+
+        Temporal stabilization: the displayed identity only changes when a
+        candidate accumulates RECOGNITION_MIN_CONSISTENT votes in the window.
+        This stops the box from flickering KNOWN <-> UNKNOWN across frames.
+        """
         self.last_recognized_frame = frame_idx
         self._recent_names.append(name if accepted else "Unknown")
         self._recent_dists.append(best_dist)
@@ -99,12 +105,24 @@ class Track:
         for n in self._recent_names:
             votes[n] = votes.get(n, 0) + 1
         voted_name = max(votes, key=votes.get)
-        accepted_dists = [d for n, d in zip(self._recent_names, self._recent_dists) if n == voted_name]
 
-        self.name = voted_name
-        self.accepted = voted_name != "Unknown"
-        self.best_dist = float(np.median(accepted_dists)) if accepted_dists else best_dist
-        self.confidence = max(0.0, 1.0 - self.best_dist)
+        # Require enough consistent votes before flipping the committed state.
+        # Until the window has filled, allow commitment as soon as a candidate
+        # reaches the available count so first-acquisition is not delayed.
+        need = min(config.RECOGNITION_MIN_CONSISTENT, len(self._recent_names))
+        if votes[voted_name] >= need:
+            self.name = voted_name
+            self.accepted = voted_name != "Unknown"
+
+        # Distance/confidence reflect the COMMITTED identity for stable display.
+        committed_dists = [
+            d for n, d in zip(self._recent_names, self._recent_dists) if n == self.name
+        ]
+        if committed_dists:
+            self.best_dist = float(np.median(committed_dists))
+        else:
+            self.best_dist = best_dist
+        self.confidence = max(0.0, 1.0 - self.best_dist) if self.accepted else 0.0
 
     def needs_recognition(self, frame_idx: int, is_locked: bool, faces_present: bool = True) -> bool:
         age = frame_idx - self.last_recognized_frame

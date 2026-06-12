@@ -46,25 +46,49 @@ class TrackingLogger:
         return (now - self._last_status_time) >= config.TRACKING_STATUS_INTERVAL_SEC
 
     # ------------------------------------------------------------------ target
-    def target_visible(self, lock_name: str, track_id: int, center: tuple, servo_angle: float) -> None:
+    def target_visible(
+        self,
+        lock_name: str,
+        track_id: int,
+        center: tuple,
+        confidence: float,
+        servo_angle: float,
+    ) -> None:
         now = time.time()
+        conf_pct = int(round(confidence * 100))
         if self._last_state in (None, "visible"):
             if self._last_state == "visible" and not self._should_repeat(now):
                 return
             _logger.info(
-                "TARGET IN FRAME: %s (track #%d) at (%.0f, %.0f) | servo %d°",
-                lock_name, track_id, center[0], center[1], int(servo_angle),
+                "TARGET IN FRAME: %s (track #%d) conf=%d%% at (%.0f, %.0f) | servo %d°",
+                lock_name, track_id, conf_pct, center[0], center[1], int(servo_angle),
             )
             self._last_status_time = now
             self._last_state = "visible"
             return
 
         _logger.info(
-            "TARGET REACQUIRED: %s (track #%d) at (%.0f, %.0f) | resuming tracking",
-            lock_name, track_id, center[0], center[1],
+            "TARGET REACQUIRED: %s (track #%d) conf=%d%% at (%.0f, %.0f) | servo %d° | resuming tracking",
+            lock_name, track_id, conf_pct, center[0], center[1], int(servo_angle),
         )
         self._last_state = "visible"
         self._last_status_time = now
+        self._last_servo_reason = None
+
+    def target_reacquiring(
+        self,
+        lock_name: str,
+        track_id: int,
+        center: tuple,
+        confidence: float,
+        servo_angle: float,
+    ) -> None:
+        conf_pct = int(round(confidence * 100))
+        _logger.info(
+            "REACQUIRING: %s (track #%d) conf=%d%% at (%.0f, %.0f) | servo %d°",
+            lock_name, track_id, conf_pct, center[0], center[1], int(servo_angle),
+        )
+        self._last_state = "reacquiring"
         self._last_servo_reason = None
 
     def target_lost(self, lock_name: str) -> None:
@@ -114,7 +138,7 @@ class TrackingLogger:
         now = time.time()
         if key == self._last_servo_reason and (now - self._last_servo_log_time) < config.TRACKING_STATUS_INTERVAL_SEC:
             return
-        msg = f"SERVO MOVE: {int(from_angle)}° → {to_angle}° ({reason})"
+        msg = f"SERVO MOVE: {int(from_angle)}° → {to_angle}° | MQTT={to_angle} ({reason})"
         _logger.info(msg)
         if self.dashboard:
             self.dashboard.add_servo_event(from_angle, to_angle, reason)
@@ -135,9 +159,18 @@ class TrackingLogger:
         self._last_servo_reason = key
         self._last_servo_log_time = now
 
+    def search_sweeping(self, angle: float) -> None:
+        """Logged when the autonomous ESP sweep command is (re)asserted."""
+        msg = f"SERVO SEARCH: autonomous sweep active (ESP 0deg<->180deg) | near {int(angle)}deg"
+        _logger.info(msg)
+        if self.dashboard:
+            self.dashboard.add_log(msg)
+        self._last_servo_reason = "search:sweep"
+        self._last_servo_log_time = time.time()
+
     def servo_search_step(self, from_angle: float, to_angle: int, step_index: int) -> None:
         reason = f"search step {step_index}"
-        msg = f"SERVO SEARCH: {int(from_angle)}° → {to_angle}° ({reason})"
+        msg = f"SERVO SEARCH: {int(from_angle)}° → {to_angle}° | MQTT={to_angle} ({reason})"
         _logger.info(msg)
         if self.dashboard:
             self.dashboard.add_servo_event(from_angle, to_angle, reason)

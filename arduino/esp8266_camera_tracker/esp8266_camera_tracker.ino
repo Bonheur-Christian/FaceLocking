@@ -1,23 +1,31 @@
 /*
  * ESP8266 Camera Tracker with Servo Motor
- * 
- * This Arduino sketch controls a servo motor to track a person's face
- * based on MQTT commands received from the Python face recognition system.
- * 
+ *
+ * Controls a pan servo that tracks a locked face based on MQTT commands from
+ * the Python face-recognition system.
+ *
+ * ----------------------------------------------------------------------------
+ * SERVO STATE MACHINE (runs in loop(), INDEPENDENT of MQTT arrival timing)
+ * ----------------------------------------------------------------------------
+ *   MODE_TRACK   : smoothly drive currentAngle -> targetAngle (1 deg / step).
+ *                  targetAngle is set by the PC on `camera/track/horizontal`.
+ *   MODE_SEARCH  : autonomous continuous sweep 0 -> 180 -> 0 -> 180 ... with
+ *                  small incremental steps. Started by the PC sending the
+ *                  command "search". The sweep is generated ON THE ESP, so it
+ *                  is perfectly smooth regardless of WiFi/MQTT jitter or loss.
+ *
+ * Any horizontal angle command, or "track"/"center"/"left"/"right", switches
+ * the servo back to MODE_TRACK. This is what stops the sweep the instant the
+ * PC re-acquires the target.
+ *
  * Hardware:
- * - ESP8266 (NodeMCU, Wemos D1 Mini, etc.)
- * - Servo motor (SG90 or similar)
- * - Camera mounted on servo
- * 
- * Connections:
- * - Servo Signal -> D4 (GPIO2)
- * - Servo VCC -> 5V
- * - Servo GND -> GND
- * 
+ * - ESP8266 (NodeMCU / Wemos D1 Mini)
+ * - Servo on SERVO_PIN, VCC 5V, common GND
+ *
  * MQTT Topics:
- * - camera/track/horizontal - Receives horizontal position (0-180 degrees)
- * - camera/track/command - Receives movement commands (left, right, center)
- * - camera/status - Publishes current servo position
+ * - camera/track/horizontal : target angle 0-180 (plain int or {"angle":N})
+ * - camera/track/command    : "search" | "track" | "center" | "left" | "right"
+ * - camera/status           : ESP publishes {"angle":N,"target":N,"mode":"..."}
  */
 
 #include <ESP8266WiFi.h>
@@ -25,23 +33,20 @@
 #include <Servo.h>
 
 // ============================================================================
-// CONFIGURATION - MODIFY THESE VALUES
+// CONFIGURATION
 // ============================================================================
 
-// WiFi credentials
-const char* ssid = "Crux Sacra";
-const char* password = "Nondracositmihidux";
+const char* ssid = "EdNet";
+const char* password = "Huawei@123";
 
-// const char* ssid = "EdNet";
-// const char* password = "Huawei@123";
+// const char* ssid = "how";
+// const char* password = "00000000";
 
-// MQTT Broker settings
-const char* mqtt_server = "157.173.101.159";  // Your MQTT broker IP
+const char* mqtt_server = "157.173.101.159";
 const int mqtt_port = 1883;
-const char* mqtt_user = "";  // Leave empty if no authentication
+const char* mqtt_user = "";
 const char* mqtt_password = "";
 
-// MQTT Topics
 const char* topic_horizontal = "camera/track/horizontal";
 const char* topic_command = "camera/track/command";
 const char* topic_status = "camera/status";
@@ -51,33 +56,36 @@ const int SERVO_PIN = 12;  // GPIO12
 const int SERVO_MIN_ANGLE = 0;
 const int SERVO_MAX_ANGLE = 180;
 const int SERVO_CENTER_ANGLE = 90;
-const int SERVO_STEP_SIZE = 10;  // Degrees per movement command
+const int SERVO_STEP_SIZE = 10;  // nudge step for left/right commands
 
-// Movement smoothing
-const int MOVEMENT_DELAY = 15;  // ms delay between servo steps for smooth movement
+// Motion timing — one degree every N ms gives smooth, jitter-free motion.
+// Lower = faster. 7ms/deg ~= 140 deg/s: fast target acquisition, still smooth.
+const unsigned long SERVO_TRACK_STEP_MS = 7;    // ~140 deg/s while tracking
+const unsigned long SERVO_SEARCH_STEP_MS = 7;   // ~140 deg/s while sweeping
 
-// Debug mode
-#define DEBUG true
-const int SERIAL_PRINT_DELAY = 30;  // ms pause after serial lines (keeps monitor readable)
-
-#if DEBUG
-void serialPause() { delay(SERIAL_PRINT_DELAY); }
-#else
-void serialPause() {}
-#endif
+// Debug (keep false in production — Serial prints stall the servo loop)
+#define DEBUG false
 
 // ============================================================================
-// GLOBAL VARIABLES
+// STATE
 // ============================================================================
+
+enum ServoMode { MODE_TRACK, MODE_SEARCH };
 
 WiFiClient espClient;
 PubSubClient client(espClient);
 Servo cameraServo;
 
+ServoMode mode = MODE_TRACK;
 int currentAngle = SERVO_CENTER_ANGLE;
 int targetAngle = SERVO_CENTER_ANGLE;
+int sweepDir = 1;  // +1 -> moving toward MAX, -1 -> moving toward MIN
+
+unsigned long lastServoStepMs = 0;
 unsigned long lastStatusUpdate = 0;
-const unsigned long STATUS_UPDATE_INTERVAL = 1000;  // Send status every 1 second
+unsigned long lastReconnectAttemptMs = 0;
+const unsigned long STATUS_UPDATE_INTERVAL = 250;  // keep PC angle estimate fresh
+const unsigned long MQTT_RECONNECT_INTERVAL_MS = 3000;
 
 // ============================================================================
 // SETUP
@@ -86,38 +94,32 @@ const unsigned long STATUS_UPDATE_INTERVAL = 1000;  // Send status every 1 secon
 void setup() {
   Serial.begin(115200);
   delay(100);
-
   Serial.println("\n\n=================================");
   Serial.println("ESP8266 Camera Tracker Starting");
   Serial.println("=================================\n");
 
-  // Initialize servo
   cameraServo.attach(SERVO_PIN);
   cameraServo.write(SERVO_CENTER_ANGLE);
   currentAngle = SERVO_CENTER_ANGLE;
   targetAngle = SERVO_CENTER_ANGLE;
-  Serial.println("✓ Servo initialized at center position");
+  mode = MODE_TRACK;
+  Serial.println("Servo initialized at center position");
 
-  // Connect to WiFi
   setup_wifi();
-
-  // Setup MQTT
   client.setServer(mqtt_server, mqtt_port);
   client.setCallback(mqtt_callback);
 
-  Serial.println("\n✓ Setup complete!");
-  Serial.println("Waiting for MQTT commands...\n");
+  Serial.println("\nSetup complete. Waiting for MQTT commands...\n");
 }
 
 // ============================================================================
-// WIFI SETUP
+// WIFI
 // ============================================================================
 
 void setup_wifi() {
   delay(10);
   Serial.print("Connecting to WiFi: ");
   Serial.println(ssid);
-
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
 
@@ -127,17 +129,11 @@ void setup_wifi() {
     Serial.print(".");
     attempts++;
   }
-
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\n✓ WiFi connected!");
-    Serial.print("  IP address: ");
+    Serial.print("\nWiFi connected. IP: ");
     Serial.println(WiFi.localIP());
-    Serial.print("  Signal strength: ");
-    Serial.print(WiFi.RSSI());
-    Serial.println(" dBm");
   } else {
-    Serial.println("\n✗ WiFi connection failed!");
-    Serial.println("  Please check your credentials and try again");
+    Serial.println("\nWiFi connection failed!");
   }
 }
 
@@ -145,40 +141,33 @@ void setup_wifi() {
 // MQTT RECONNECT
 // ============================================================================
 
-void reconnect() {
-  while (!client.connected()) {
-    Serial.print("Connecting to MQTT broker...");
+void ensureMqttConnected() {
+  if (client.connected()) {
+    return;
+  }
+  unsigned long now = millis();
+  if (now - lastReconnectAttemptMs < MQTT_RECONNECT_INTERVAL_MS) {
+    return;
+  }
+  lastReconnectAttemptMs = now;
 
-    String clientId = "ESP8266_CameraTracker_";
-    clientId += String(random(0xffff), HEX);
+  Serial.print("Connecting to MQTT broker...");
+  String clientId = "ESP8266_CameraTracker_";
+  clientId += String(random(0xffff), HEX);
 
-    if (client.connect(clientId.c_str(), mqtt_user, mqtt_password)) {
-      Serial.println(" connected!");
-
-      // Subscribe to topics
-      client.subscribe(topic_horizontal);
-      client.subscribe(topic_command);
-
-      Serial.println("✓ Subscribed to topics:");
-      Serial.print("  - ");
-      Serial.println(topic_horizontal);
-      Serial.print("  - ");
-      Serial.println(topic_command);
-
-      // Publish initial status
-      publishStatus();
-
-    } else {
-      Serial.print(" failed, rc=");
-      Serial.print(client.state());
-      Serial.println(" retrying in 5 seconds...");
-      delay(5000);
-    }
+  if (client.connect(clientId.c_str(), mqtt_user, mqtt_password)) {
+    Serial.println(" connected!");
+    client.subscribe(topic_horizontal);
+    client.subscribe(topic_command);
+    publishStatus();
+  } else {
+    Serial.print(" failed, rc=");
+    Serial.println(client.state());
   }
 }
 
 // ============================================================================
-// MESSAGE PARSING — plain text or JSON {"angle":N} / {"command":"left"}
+// MESSAGE PARSING
 // ============================================================================
 
 int parseAngleFromMessage(const String& message) {
@@ -217,120 +206,107 @@ String parseCommandFromMessage(const String& message) {
   return trimmed;
 }
 
+// Switch to tracking mode aimed at a specific angle.
+void enterTrackMode(int angle) {
+  angle = constrain(angle, SERVO_MIN_ANGLE, SERVO_MAX_ANGLE);
+  targetAngle = angle;
+  if (mode != MODE_TRACK) {
+    mode = MODE_TRACK;
+    publishStatus();
+  }
+}
+
 // ============================================================================
-// MQTT CALLBACK - Handle incoming messages
+// MQTT CALLBACK
 // ============================================================================
 
 void mqtt_callback(char* topic, byte* payload, unsigned int length) {
-  // Convert payload to string
   String message = "";
   for (unsigned int i = 0; i < length; i++) {
     message += (char)payload[i];
   }
 
-  Serial.print("📨 Received [");
-  Serial.print(topic);
-  Serial.print("]: ");
-  Serial.println(message);
-  serialPause();
+  if (DEBUG) {
+    Serial.print("Received [");
+    Serial.print(topic);
+    Serial.print("]: ");
+    Serial.println(message);
+  }
 
-  // Handle horizontal position (degrees)
+  // Horizontal angle => always tracking mode toward that angle.
   if (strcmp(topic, topic_horizontal) == 0) {
     int angle = parseAngleFromMessage(message);
     if (angle >= SERVO_MIN_ANGLE && angle <= SERVO_MAX_ANGLE) {
-      targetAngle = angle;
-
-      if (DEBUG) {
-        Serial.print("📌 Current Angle: ");
-        Serial.print(currentAngle);
-        Serial.print(" | New Target: ");
-        Serial.println(targetAngle);
-        serialPause();
-      }
-
-      Serial.print("→ Target angle set to: ");
-      Serial.println(targetAngle);
-      serialPause();
-    } else {
-      Serial.println("✗ Invalid angle (must be 0-180)");
+      enterTrackMode(angle);
     }
+    return;
   }
 
-  // Handle movement commands (left, right, center)
-  else if (strcmp(topic, topic_command) == 0) {
+  // Commands.
+  if (strcmp(topic, topic_command) == 0) {
     String command = parseCommandFromMessage(message);
     command.toLowerCase();
 
-    if (command == "left" || command == "move_left") {
-      targetAngle = constrain(currentAngle - SERVO_STEP_SIZE, SERVO_MIN_ANGLE, SERVO_MAX_ANGLE);
-      Serial.print("← Moving left to: ");
-      Serial.println(targetAngle);
-      serialPause();
-    } else if (command == "right" || command == "move_right") {
-      targetAngle = constrain(currentAngle + SERVO_STEP_SIZE, SERVO_MIN_ANGLE, SERVO_MAX_ANGLE);
-      Serial.print("→ Moving right to: ");
-      Serial.println(targetAngle);
-      serialPause();
+    if (command == "search" || command == "sweep") {
+      if (mode != MODE_SEARCH) {
+        mode = MODE_SEARCH;
+        // Continue sweeping from the current physical position; pick the
+        // direction that has the most travel room so we never start by
+        // slamming into an endpoint.
+        sweepDir = (currentAngle <= (SERVO_MIN_ANGLE + SERVO_MAX_ANGLE) / 2) ? 1 : -1;
+        publishStatus();
+      }
+    } else if (command == "track" || command == "stop") {
+      enterTrackMode(currentAngle);  // hold here, stop sweeping
     } else if (command == "center") {
-      targetAngle = SERVO_CENTER_ANGLE;
-      Serial.print("⊙ Centering to: ");
-      Serial.println(targetAngle);
-      serialPause();
-    } else {
-      Serial.print("✗ Unknown command: ");
-      Serial.println(command);
+      enterTrackMode(SERVO_CENTER_ANGLE);
+    } else if (command == "left" || command == "move_left") {
+      enterTrackMode(currentAngle - SERVO_STEP_SIZE);
+    } else if (command == "right" || command == "move_right") {
+      enterTrackMode(currentAngle + SERVO_STEP_SIZE);
     }
   }
 }
 
 // ============================================================================
-// SMOOTH SERVO MOVEMENT
+// SERVO STATE MACHINE — incremental, smooth, runs every loop()
 // ============================================================================
-void updateServoPosition() {
 
-  if (currentAngle != targetAngle) {
+void updateServo() {
+  unsigned long now = millis();
 
-    if (DEBUG) {
-      Serial.print("🔄 Moving | Current: ");
-      Serial.print(currentAngle);
-      Serial.print(" -> Target: ");
-      Serial.println(targetAngle);
-      serialPause();
+  if (mode == MODE_SEARCH) {
+    if (now - lastServoStepMs < SERVO_SEARCH_STEP_MS) {
+      return;
     }
+    lastServoStepMs = now;
 
-    // Determine direction
-    if (currentAngle < targetAngle) {
-      currentAngle++;
-      if (DEBUG) {
-        Serial.println("➡ Direction: RIGHT (+1)");
-        serialPause();
-      }
-    } else if (currentAngle > targetAngle) {
-      currentAngle--;
-      if (DEBUG) {
-        Serial.println("⬅ Direction: LEFT (-1)");
-        serialPause();
-      }
+    currentAngle += sweepDir;
+    if (currentAngle >= SERVO_MAX_ANGLE) {
+      currentAngle = SERVO_MAX_ANGLE;
+      sweepDir = -1;
+    } else if (currentAngle <= SERVO_MIN_ANGLE) {
+      currentAngle = SERVO_MIN_ANGLE;
+      sweepDir = 1;
     }
-
     cameraServo.write(currentAngle);
+    return;
+  }
 
-    if (DEBUG) {
-      Serial.print("📍 Servo now at: ");
-      Serial.println(currentAngle);
-      serialPause();
-    }
+  // MODE_TRACK
+  if (currentAngle == targetAngle) {
+    return;
+  }
+  if (now - lastServoStepMs < SERVO_TRACK_STEP_MS) {
+    return;
+  }
+  lastServoStepMs = now;
 
-    delay(MOVEMENT_DELAY);
+  currentAngle += (currentAngle < targetAngle) ? 1 : -1;
+  cameraServo.write(currentAngle);
 
-    // Movement completed
-    if (currentAngle == targetAngle) {
-      Serial.println("✅ Movement Complete");
-      Serial.print("🎯 Final Position: ");
-      Serial.println(currentAngle);
-      serialPause();
-      publishStatus();
-    }
+  if (currentAngle == targetAngle) {
+    publishStatus();
   }
 }
 
@@ -339,17 +315,12 @@ void updateServoPosition() {
 // ============================================================================
 
 void publishStatus() {
-  String status = "{\"angle\":" + String(currentAngle) + 
-                  ",\"target\":" + String(targetAngle) + 
-                  ",\"moving\":" + (currentAngle != targetAngle ? "true" : "false") + "}";
-
+  String modeStr = (mode == MODE_SEARCH) ? "search" : "track";
+  String status = "{\"angle\":" + String(currentAngle) +
+                  ",\"target\":" + String(targetAngle) +
+                  ",\"mode\":\"" + modeStr + "\"" +
+                  ",\"moving\":" + ((mode == MODE_SEARCH || currentAngle != targetAngle) ? "true" : "false") + "}";
   client.publish(topic_status, status.c_str());
-
-  if (DEBUG) {
-    Serial.print("📤 Published Status: ");
-    Serial.println(status);
-    serialPause();
-  }
 }
 
 // ============================================================================
@@ -357,16 +328,11 @@ void publishStatus() {
 // ============================================================================
 
 void loop() {
-  // Maintain MQTT connection
-  if (!client.connected()) {
-    reconnect();
-  }
+  ensureMqttConnected();
   client.loop();
 
-  // Update servo position smoothly
-  updateServoPosition();
+  updateServo();
 
-  // Publish status periodically
   unsigned long now = millis();
   if (now - lastStatusUpdate > STATUS_UPDATE_INTERVAL) {
     publishStatus();

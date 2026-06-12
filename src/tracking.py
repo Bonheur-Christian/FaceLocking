@@ -1,34 +1,36 @@
 """
 Pan tracking controller for the MQTT servo camera.
 
-Responsibilities
-----------------
-TRACKING: Keep the locked face centered using a PID controller on the
-  normalised horizontal error, with:
-  - pixel dead zone (no micro-jitter when centred)
-  - EMA smoothing on both the raw error AND the commanded output angle
-  - per-update rate limit so the servo never jumps violently
-  - SERVO_OUTPUT_SMOOTHING applied to the final angle command → smooth motion
+STATE MACHINE
+─────────────
+  SEARCHING  Locked person not detected.
+             A background daemon thread sweeps 0→180→0→180... at
+             SEARCH_SPEED, independently of the camera frame rate.
+             Face detection does NOT affect this thread. The servo
+             NEVER pauses, NEVER dwells at edges. The ONLY way to
+             stop the sweep is to call reset() (target found).
 
-SEARCH: When the locked target is lost (or has been unrecognised too long),
-  run an autonomous direction-aware expanding sweep that keeps publishing
-  servo waypoints until the target is reacquired.  The sweep is time-driven
-  (not frame-driven) and loops indefinitely — it will NEVER stop until
-  pan.reset() is called by the caller when the target returns.
+  TRACKING   Locked person detected but NOT centred.
+             P+D controller moves the servo toward the face every
+             frame. Keeps moving until |error| <= CENTER_DEADBAND.
+             Does NOT stop simply because a face is detected.
 
-Key design rules
-----------------
-- Servo control is ONLY ever driven by the locked face.  Other known faces
-  have zero influence on the PanTracker.
-- Search mode runs unconditionally once started; it is the caller's
-  responsibility to call pan.reset() (which cancels search) when the target
-  is reacquired.
-- Output-angle EMA (SERVO_OUTPUT_SMOOTHING) is applied after the PID so the
-  angle command changes smoothly even when the PID output jumps.
+  CENTERED   Locked person detected AND within CENTER_DEADBAND.
+             Servo holds. If person drifts past CENTER_DEADBAND_RESUME
+             it resumes TRACKING. If person disappears → SEARCHING.
+
+THREAD DESIGN
+─────────────
+  _sweep_worker runs in a daemon thread.
+  It owns all servo motion while searching. The main (camera) thread
+  NEVER calls move_to_angle() while the sweep thread is alive, so
+  there is no contention and the sweep is continuous and uninterrupted.
+  The thread sleeps for SEARCH_UPDATE_INTERVAL between steps and
+  wakes immediately when _sweep_stop is set.
 """
 
-import time
-from typing import List, Optional, Tuple, TYPE_CHECKING
+import threading
+from typing import Optional, Tuple, TYPE_CHECKING
 
 from . import config
 from .mqtt_camera_controller import MQTTCameraController
@@ -37,12 +39,11 @@ if TYPE_CHECKING:
     from .tracking_log import TrackingLogger
 
 
-def _clamp(value: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, value))
+def _clamp(v: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, v))
 
 
 class PanTracker:
-    """Maps a locked face's horizontal position to smooth servo motion."""
 
     def __init__(
         self,
@@ -52,84 +53,182 @@ class PanTracker:
         self.mqtt = mqtt
         self.log = logger
 
-        # PID state
+        # PID / tracking state
         self.smoothed_error: Optional[float] = None
         self.prev_error: float = 0.0
         self.integral: float = 0.0
         self.target_angle: float = float(config.SERVO_CENTER_ANGLE)
-
-        # EMA on the OUTPUT angle command — prevents jitter / sudden jumps.
         self._smooth_angle: Optional[float] = None
-
-        # Centering state
-        self.frames_in_center = 0
-        self.center_locked = False
-
-        # Reacquisition memory — which side did the face exit from?
+        self._holding: bool = False
+        self.frames_in_center: int = 0
+        self.center_locked: bool = False
         self.last_error_sign: int = 0
         self.last_known_angle: float = float(config.SERVO_CENTER_ANGLE)
+        self.search_manual: bool = False
 
-        # Search state
-        self.search_manual = False
-        self._search_waypoints: List[int] = []
-        self._search_index = 0
-        self._last_search_step_time = 0.0
-        self._last_search_angle: Optional[int] = None
-        self._endpoint_dwell_until = 0.0
+        # Background sweep thread.
+        # _sweep_stop is SET when not sweeping (Event.wait returns immediately
+        # when set, which is how we make the thread exit fast).
+        self._sweep_stop = threading.Event()
+        self._sweep_stop.set()          # Not sweeping at startup
+        self._sweep_thread: Optional[threading.Thread] = None
 
-    # ------------------------------------------------------------------ utils
-    def reset(self) -> None:
-        """Cancel any active search and reset PID + smoothing state."""
-        self.smoothed_error = None
-        self.prev_error = 0.0
-        self.integral = 0.0
-        self._smooth_angle = None
-        self.frames_in_center = 0
-        self.center_locked = False
-        self.search_manual = False
-        self._search_waypoints = []
-        self._search_index = 0
-        self._last_search_angle = None
-        self._endpoint_dwell_until = 0.0
+    # ── properties ────────────────────────────────────────────────────────────
 
     @property
     def current_angle(self) -> float:
-        """Last angle acknowledged by the MQTT controller (or our local target)."""
+        """ESP-reported physical angle, or our internal target if no MQTT."""
         if self.mqtt:
             return float(self.mqtt.current_angle)
         return self.target_angle
 
+    @property
+    def is_searching(self) -> bool:
+        """True while the background sweep thread is alive."""
+        return self._sweep_thread is not None and self._sweep_thread.is_alive()
+
     def normalized_error(self, face_center_x: float, frame_width: int) -> float:
         return (face_center_x - frame_width / 2.0) / (frame_width / 2.0)
-
-    def _in_dead_zone(self, face_center_x: float, frame_width: int) -> bool:
-        """Return True only if face is within CENTER_DEAD_ZONE pixels of frame centre."""
-        return abs(face_center_x - frame_width / 2.0) < config.CENTER_DEAD_ZONE
 
     def in_center_zone(self, error: float) -> bool:
         return abs(error) < config.CENTERING_TOLERANCE
 
-    # ---------------------------------------------------------------- tracking
+    # ── reset ─────────────────────────────────────────────────────────────────
+
+    def reset(self) -> None:
+        """
+        Stop any active sweep and reset PID state for clean re-acquisition.
+        Seeds the PID from the current physical position so tracking resumes
+        smoothly from wherever the sweep left the camera.
+        """
+        self._stop_sweep()
+        self.smoothed_error = None
+        self.prev_error = 0.0
+        self.integral = 0.0
+        self.target_angle = float(self.current_angle)
+        self._smooth_angle = float(self.current_angle)
+        self._holding = False
+        self.frames_in_center = 0
+        self.center_locked = False
+        self.search_manual = False
+
+    # ── SEARCH — background thread ─────────────────────────────────────────
+
+    def search(self) -> Tuple[str, Optional[int]]:
+        """
+        Ensure the autonomous sweep thread is running.
+
+        Idempotent and cheap: calling this every frame while in SEARCHING
+        state is safe; it only launches the thread once. The sweep continues
+        completely independently until reset() is called.
+        """
+        if not self.mqtt:
+            if self.log:
+                self.log.servo_hold(self.current_angle, "MQTT not connected — sweep paused")
+            return ("searching", None)
+        if not self.is_searching:
+            self._start_sweep()
+        return ("searching", None)
+
+    def _start_sweep(self) -> None:
+        """Launch the background sweep thread."""
+        self._sweep_stop.clear()          # Allow the thread to run
+        self._sweep_thread = threading.Thread(
+            target=self._sweep_worker,
+            name="servo-sweep",
+            daemon=True,                  # Dies automatically when main exits
+        )
+        self._sweep_thread.start()
+        if self.log:
+            self.log.search_sweeping(self.current_angle)
+
+    def _stop_sweep(self) -> None:
+        """
+        Signal the sweep thread to stop and wait for it to exit.
+        The thread wakes from its timed sleep within SEARCH_UPDATE_INTERVAL
+        (~14 ms), so this blocks for at most ~20 ms.
+        """
+        self._sweep_stop.set()            # Wake the sleeping thread
+        t = self._sweep_thread
+        if t is not None and t.is_alive():
+            t.join(timeout=0.5)           # At most 500 ms; actual < 20 ms
+        self._sweep_thread = None
+
+    def _sweep_worker(self) -> None:
+        """
+        Autonomous background sweep: 0° → 180° → 0° → 180° ...
+
+        Runs at SEARCH_SPEED deg/s, completely independent of:
+          - Camera frame rate
+          - Detection / recognition speed
+          - MQTT publish timing
+          - Face detection results
+
+        The loop never pauses at the edges. Direction reverses INSTANTLY
+        when a limit is reached. The thread exits within one sleep interval
+        after _sweep_stop is set.
+        """
+        lo = config.SEARCH_MIN_ANGLE        # 0
+        hi = config.SEARCH_MAX_ANGLE        # 180
+        step_deg = max(1, int(config.SEARCH_STEP))          # degrees per step
+        step_sec = max(0.005, float(config.SEARCH_UPDATE_INTERVAL))  # seconds
+
+        # ── Go to 0° first, as required ───────────────────────────────────
+        if self.mqtt and self.mqtt.is_connected:
+            self.mqtt.move_to_angle(lo)
+
+        pos = float(lo)
+        direction = 1   # +1 → sweeping toward hi, -1 → sweeping toward lo
+
+        while not self._sweep_stop.is_set():
+            # Advance position.
+            pos += direction * step_deg
+
+            # Instant direction reversal at limits — NO dwell, NO pause.
+            if pos >= hi:
+                pos = float(hi)
+                direction = -1
+            elif pos <= lo:
+                pos = float(lo)
+                direction = 1
+
+            # Publish directly, bypassing the main-thread rate limiter.
+            if self.mqtt:
+                if self.mqtt.is_connected:
+                    self.mqtt.sweep_move(int(pos))
+                # If disconnected: just wait — do NOT exit the sweep loop.
+                # The servo will resume sweeping as soon as MQTT reconnects.
+
+            # Interruptible sleep. Event.wait(timeout) returns immediately
+            # when _sweep_stop is set, making the thread exit fast.
+            self._sweep_stop.wait(step_sec)
+
+    # ── TRACKING — main thread ─────────────────────────────────────────────
+
     def track(self, face_center_x: float, frame_width: int) -> Tuple[str, Optional[int]]:
         """
         PID-control the servo to centre the locked face.
 
-        Returns (state_label, commanded_angle | None).
-        state_label is one of: "centered", "tracking".
+        STOP CONDITION: the servo holds ONLY when |error| <= CENTER_DEADBAND.
+        Off-centre detected face => servo KEEPS MOVING toward the target.
         """
-        # Cancel any active search the instant we have a confirmed target.
-        if self._search_waypoints:
-            self._search_waypoints = []
-            self._search_index = 0
+        # First call with a confirmed target: stop the sweep.
+        if self.is_searching:
+            self._stop_sweep()
+            # Seed PID from current physical position to avoid a jump.
+            self.target_angle = float(self.current_angle)
+            self._smooth_angle = float(self.current_angle)
+            self.smoothed_error = None
+            self._holding = False
 
         raw_error = self.normalized_error(face_center_x, frame_width)
 
-        # Remember exit direction for later search bias.
+        # Remember exit direction for search bias on next loss.
         if abs(raw_error) > config.CENTERING_TOLERANCE:
             self.last_error_sign = 1 if raw_error > 0 else -1
         self.last_known_angle = self.current_angle
 
-        # Centering state bookkeeping.
+        # Centering counter.
         if self.in_center_zone(raw_error):
             self.frames_in_center += 1
             self.center_locked = self.frames_in_center >= config.FRAMES_TO_LOCK_CENTER
@@ -137,17 +236,27 @@ class PanTracker:
             self.frames_in_center = 0
             self.center_locked = False
 
-        # Dead zone: do not chase micro-offsets (prevents jitter at centre).
-        if self._in_dead_zone(face_center_x, frame_width):
-            self.prev_error = raw_error
-            self.integral = 0.0
+        # ── Dead-band with hysteresis ─────────────────────────────────────
+        # _holding = True ONLY when inside CENTER_DEADBAND.
+        # Hysteresis: once centred, only resume when face drifts past
+        # CENTER_DEADBAND_RESUME, preventing chatter at the boundary.
+        err_px = abs(face_center_x - frame_width / 2.0)
+        if self._holding:
+            # Currently centred — resume chasing only if drifted far enough.
+            if err_px > config.CENTER_DEADBAND_RESUME:
+                self._holding = False
+        else:
+            # Currently moving — stop only when inside the inner band.
+            if err_px <= config.CENTER_DEADBAND:
+                self._holding = True
+
+        if self._holding:
             label = "centered" if self.center_locked else "tracking"
             if self.log:
-                reason = "face centred in dead zone" if self.center_locked else "within dead zone"
-                self.log.servo_hold(self.current_angle, reason)
+                self.log.servo_hold(self.current_angle, f"centred ({err_px:.0f}px <= {config.CENTER_DEADBAND}px)")
             return (label, None)
 
-        # EMA on raw error — attenuates detection noise.
+        # ── P+D position controller ───────────────────────────────────────
         a = config.SMOOTHING_FACTOR
         if self.smoothed_error is None:
             self.smoothed_error = raw_error
@@ -155,195 +264,80 @@ class PanTracker:
             self.smoothed_error = a * raw_error + (1.0 - a) * self.smoothed_error
         error = self.smoothed_error
 
-        # PID terms.
-        ki = config.SERVO_PID_KI
-        if ki > 0:
-            clamp_val = config.SERVO_PID_I_CLAMP / ki
-            self.integral = _clamp(self.integral + error, -clamp_val, clamp_val)
-        else:
-            self.integral = 0.0
-
         derivative = error - self.prev_error
         self.prev_error = error
 
         delta = (
             config.SERVO_PID_KP * error
-            + config.SERVO_PID_KI * self.integral
             + config.SERVO_PID_KD * derivative
-        )
-        delta *= config.SERVO_DIRECTION_SIGN
+        ) * config.SERVO_DIRECTION_SIGN
 
-        # Rate limit — prevents violent servo jumps.
+        # Guarantee ≥1° correction when off-centre so the servo never stalls
+        # before reaching the dead-band.
+        if -1.0 < delta < 0.0:
+            delta = -1.0
+        elif 0.0 < delta < 1.0:
+            delta = 1.0
+
+        # Rate limit: small incremental steps — no jumps.
         delta = _clamp(delta, -config.SERVO_MAX_SPEED, config.SERVO_MAX_SPEED)
 
-        desired_angle = _clamp(
-            self.current_angle + delta,
+        # Integrate onto our OWN target (decoupled from the lagging ESP angle).
+        self.target_angle = _clamp(
+            self.target_angle + delta,
             config.SERVO_MIN_ANGLE,
             config.SERVO_MAX_ANGLE,
         )
-        self.target_angle = desired_angle
 
-        # Output-angle EMA — smooths the command sent to the servo so motion
-        # is fluid even when the PID output jumps.
+        # Output EMA — one more smoothing layer.
         alpha = config.SERVO_OUTPUT_SMOOTHING
         if self._smooth_angle is None:
-            self._smooth_angle = desired_angle
+            self._smooth_angle = self.target_angle
         else:
-            self._smooth_angle = self._smooth_angle + alpha * (desired_angle - self._smooth_angle)
+            self._smooth_angle += alpha * (self.target_angle - self._smooth_angle)
 
-        commanded = None
         command_angle = int(round(self._smooth_angle))
-        from_angle = self.current_angle
 
         if not self.mqtt:
-            if self.log:
-                self.log.servo_hold(from_angle, "MQTT not connected")
             return ("tracking", None)
 
-        if self.mqtt.move_to_angle(command_angle):
-            commanded = command_angle
+        from_angle = self.current_angle
+        published = self.mqtt.move_to_angle(command_angle)
+        # If dedup/rate-limit blocked but face is still off-centre, nudge 1°
+        # toward the error so the servo never stalls while tracking.
+        if not published and abs(raw_error) > config.CENTERING_TOLERANCE:
+            nudge = command_angle + (1 if raw_error > 0 else -1)
+            nudge = int(_clamp(nudge, config.SERVO_MIN_ANGLE, config.SERVO_MAX_ANGLE))
+            published = self.mqtt.move_to_angle(nudge, force=True)
+            if published:
+                command_angle = nudge
+
+        if published:
             if self.log:
                 side = "right" if raw_error > 0 else "left"
                 self.log.servo_move(
                     from_angle, command_angle,
-                    f"centering face ({side}, err={raw_error:+.2f})",
+                    f"centering ({side}, err={raw_error:+.2f})",
                 )
         elif self.log:
-            if abs(command_angle - from_angle) < 1:
-                self.log.servo_hold(from_angle, "already at target angle")
-            else:
-                self.log.servo_hold(from_angle, "rate limited or command skipped")
+            self.log.servo_hold(from_angle, "already at target or rate-limited")
 
-        return ("tracking", commanded)
+        return ("tracking", command_angle if published else None)
 
-    # ------------------------------------------------------------------ search
-    def _build_search_waypoints(self) -> List[int]:
-        """
-        Direction-aware, expanding sweep across the full search arc.
+    # ── manual controls ───────────────────────────────────────────────────────
 
-        Phase 1 — Expand outward from last_known_angle (primary side first).
-        Phase 2 — Full edge-to-edge sweep (looped indefinitely via modulo).
-        """
-        lo = config.SEARCH_MIN_ANGLE
-        hi = config.SEARCH_MAX_ANGLE
-        step = config.SEARCH_SWEEP_STEP
-
-        if config.SEARCH_START_DIRECTION == "left":
-            primary = -1
-        elif config.SEARCH_START_DIRECTION == "right":
-            primary = 1
-        else:  # "last" — look the way the face exited
-            primary = self.last_error_sign or 1
-        primary *= config.SERVO_DIRECTION_SIGN
-
-        waypoints: List[int] = []
-
-        if config.SEARCH_EXPAND_ENABLED:
-            base = int(round(_clamp(self.last_known_angle, lo, hi)))
-            waypoints.append(base)
-            amp = step
-            while True:
-                first = int(round(_clamp(base + primary * amp, lo, hi)))
-                second = int(round(_clamp(base - primary * amp, lo, hi)))
-                waypoints.append(first)
-                waypoints.append(second)
-                if base + amp >= hi and base - amp <= lo:
-                    break
-                amp += step
-
-        # Full edge-to-edge sweep — forms the repeating loop.
-        sweep = list(range(lo, hi + 1, step))
-        if sweep[-1] != hi:
-            sweep.append(hi)
-        if primary < 0:
-            sweep = list(reversed(sweep))
-        # One full back-and-forth cycle so the loop never reaches a dead end.
-        waypoints.extend(sweep)
-        waypoints.extend(reversed(sweep))
-
-        # Remove consecutive duplicates while preserving order.
-        deduped: List[int] = []
-        for angle in waypoints:
-            if not deduped or deduped[-1] != angle:
-                deduped.append(angle)
-        return deduped
-
-    def search(self) -> Tuple[str, Optional[int]]:
-        """
-        Advance the autonomous search sweep.
-
-        This is called every loop iteration while in SEARCHING state.  It is
-        time-driven: waypoints are advanced only when enough time has elapsed,
-        so calling it every frame is safe and cheap.
-
-        Returns (state, commanded_angle | None).
-        """
-        # Reset PID state so re-acquisition starts cleanly.
-        self.smoothed_error = None
-        self._smooth_angle = None
-        self.integral = 0.0
-        self.center_locked = False
-        self.frames_in_center = 0
-
-        # Build waypoints once per search episode.
-        if not self._search_waypoints:
-            self._search_waypoints = self._build_search_waypoints()
-            self._search_index = 0
-            self._last_search_step_time = 0.0
-
-        if not self.mqtt:
-            if self.log:
-                self.log.servo_hold(self.current_angle, "search paused — MQTT not connected")
-            return ("searching", None)
-
-        now = time.time()
-
-        # Honour endpoint dwell (camera needs to settle at extremes).
-        if now < self._endpoint_dwell_until:
-            if self.log:
-                self.log.servo_hold(self.current_angle, "search dwell at sweep endpoint")
-            return ("searching", None)
-
-        # Time-gate between sweep steps.
-        step_interval = config.SEARCH_SWEEP_STEP / max(config.SEARCH_SWEEP_SPEED, 1e-3)
-        if now - self._last_search_step_time < step_interval:
-            return ("searching", None)
-
-        from_angle = self.current_angle
-
-        # Advance through waypoints, looping via modulo so search NEVER stops.
-        angle = self._search_waypoints[self._search_index % len(self._search_waypoints)]
-        lo, hi = config.SEARCH_MIN_ANGLE, config.SEARCH_MAX_ANGLE
-
-        if angle in (lo, hi) and angle != self._last_search_angle:
-            self._endpoint_dwell_until = now + config.SEARCH_ENDPOINT_DWELL_SEC
-
-        self._last_search_angle = angle
-        step_num = self._search_index + 1
-        self._search_index += 1
-        self._last_search_step_time = now
-
-        commanded = None
-        if self.mqtt.move_to_angle(int(angle)):
-            commanded = int(angle)
-            if self.log:
-                self.log.servo_search_step(from_angle, int(angle), step_num)
-        elif self.log:
-            self.log.servo_hold(from_angle, "search step skipped (rate limited)")
-
-        return ("searching", commanded)
-
-    # ------------------------------------------------------------------ manual
     def toggle_search(self) -> None:
-        """Toggle manual search mode (keyboard shortcut 's')."""
+        """Toggle manual search (keyboard shortcut 's')."""
         self.search_manual = not self.search_manual
         if self.search_manual:
-            self._search_waypoints = []
-            self._search_index = 0
+            self.search()
+        else:
+            self._stop_sweep()
 
     def force_center(self) -> None:
-        """Center the servo immediately (keyboard shortcut 'c')."""
+        """Center immediately (keyboard shortcut 'c')."""
         self.reset()
         self.target_angle = float(config.SERVO_CENTER_ANGLE)
+        self._smooth_angle = float(config.SERVO_CENTER_ANGLE)
         if self.mqtt:
             self.mqtt.center()

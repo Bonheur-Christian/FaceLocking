@@ -18,6 +18,7 @@ from .embed import ArcFaceEmbedder
 from .haar_5pt import HaarMediaPipeFaceDetector
 from .recognition_core import (
     FaceResult,
+    build_gallery,
     choose_lock_identity,
     draw_results,
     find_locked_result,
@@ -41,7 +42,7 @@ def main(start_fullscreen: bool = False):
     embedder = ArcFaceEmbedder(config.ARCFACE_MODEL_PATH)
 
     names = sorted(db.keys())
-    embeddings_matrix = np.stack([db[n].reshape(-1) for n in names], axis=0).astype(np.float32)
+    gallery, gallery_owner = build_gallery(db, names)
 
     lock_name: Optional[str] = choose_lock_identity(names)
 
@@ -126,7 +127,7 @@ def main(start_fullscreen: bool = False):
                 if faces:
                     cached_results = process_faces(
                         frame, faces, aligner, embedder,
-                        embeddings_matrix, names, threshold, lock_name,
+                        gallery, gallery_owner, names, threshold, lock_name,
                     )
                     hold_frames = config.ACCEPT_HOLD_FRAMES
                 else:
@@ -233,7 +234,7 @@ def main(start_fullscreen: bool = False):
             if key == ord("r"):
                 db = load_database()
                 names = sorted(db.keys())
-                embeddings_matrix = np.stack([db[n].reshape(-1) for n in names], axis=0).astype(np.float32)
+                gallery, gallery_owner = build_gallery(db, names)
                 cached_results = []
                 lock_lost_frames = 0
                 if lock_name and lock_name not in names:

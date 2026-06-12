@@ -86,11 +86,34 @@ EMBEDDING_PREPROCESS_SCALE = 128.0
 # ENROLLMENT SETTINGS
 # ============================================================================
 
-SAMPLES_NEEDED_FOR_ENROLLMENT = 15
-MIN_SAMPLES_TO_SAVE = 3
+SAMPLES_NEEDED_FOR_ENROLLMENT = 20
+MIN_SAMPLES_TO_SAVE = 5
 MAX_EXISTING_CROPS_PER_PERSON = 300
 AUTO_CAPTURE_INTERVAL_SECONDS = 0.25
 SAVE_ENROLLMENT_CROPS = True
+
+# ----------------------------------------------------------------------------
+# ENROLLMENT QUALITY GATES — only high-quality samples are stored.
+# ----------------------------------------------------------------------------
+# Blur: variance of the Laplacian of the aligned crop. Below = too blurry.
+ENROLL_BLUR_MIN_VAR = 45.0
+# Face size in the ORIGINAL frame (reject tiny / far faces).
+ENROLL_MIN_FACE_PX = 90          # min bbox width (px)
+ENROLL_MIN_EYE_DIST_PX = 32      # min inter-ocular distance (px)
+# Pose: how far the nose may sit from the eye-midline, as a fraction of the
+# inter-ocular distance. Rejects extreme yaw / profile faces.
+ENROLL_MAX_POSE_RATIO = 0.35
+# Reject a new sample whose cosine similarity to an already-kept sample exceeds
+# this (near-duplicate → adds no diversity). Keeps the template varied.
+ENROLL_DUP_SIMILARITY = 0.965
+# Cap on stored embeddings per person (diverse subset is kept).
+ENROLL_MAX_EMBEDDINGS = 30
+
+# ----------------------------------------------------------------------------
+# RUNTIME RECOGNITION QUALITY GATE
+# ----------------------------------------------------------------------------
+# Skip embedding faces that are clearly too blurry to recognise reliably.
+RECOGNITION_BLUR_MIN_VAR = 25.0
 
 # ============================================================================
 # RECOGNITION & THRESHOLD SETTINGS
@@ -112,7 +135,13 @@ RECOGNITION_INTERVAL_LOCKED_FACE = 1   # Re-embed locked track every frame for f
 RECOGNITION_INTERVAL_IDLE = 20
 RECOGNITION_COOLDOWN_FRAMES = 4
 RECOGNITION_COOLDOWN_FRAMES_FACE = 3
-RECOGNITION_STABILIZE_WINDOW = 3
+RECOGNITION_STABILIZE_WINDOW = 5  # Frames of voting history (temporal stability)
+RECOGNITION_MIN_CONSISTENT = 3    # Consistent votes required to flip identity state
+
+# Multi-embedding matching: each person stores several enrollment embeddings.
+# A query is scored against a person using the mean of its TOP-K nearest
+# stored embeddings (robust to pose variation; avoids single-sample outliers).
+RECOGNITION_TOPK = 3
 
 # ============================================================================
 # RECOGNITION PIPELINE OPTIMIZATION
@@ -196,7 +225,7 @@ MQTT_TOPIC_COMMAND = "camera/track/command"
 MQTT_TOPIC_STATUS = "camera/status"
 MQTT_KEEPALIVE = 30
 MQTT_QOS = 1
-MQTT_MIN_COMMAND_INTERVAL_MS = 30  # Max ~33 servo commands/sec
+MQTT_MIN_COMMAND_INTERVAL_MS = 20  # Tracking rate limiter (~50 cmds/sec max)
 
 # ----------------------------------------------------------------------------
 # SERVO CONTROL (must match ESP8266 firmware limits)
@@ -213,22 +242,40 @@ CENTER_ANGLE = SERVO_CENTER_ANGLE
 # -1 if it pans toward image-left. Flip this if the camera chases the wrong way.
 SERVO_DIRECTION_SIGN = 1
 
-# PID-style pan controller (operates on normalized horizontal error in [-1, 1])
-SERVO_PID_KP = 22.0   # Proportional gain — reduced from 26 to prevent overshoot
-SERVO_PID_KI = 0.0    # Integral gain (kept 0 by default to avoid windup)
-SERVO_PID_KD = 5.0    # Derivative gain — reduced from 7 for less jitter
-SERVO_PID_I_CLAMP = 8.0  # Max absolute integral contribution (deg)
+# ----------------------------------------------------------------------------
+# PAN CONTROLLER (P + D on the smoothed normalized horizontal error)
+# ----------------------------------------------------------------------------
+# The controller is a POSITION controller that integrates onto the PC's OWN
+# commanded target angle (NOT the lagging ESP-reported angle). This removes the
+# transport-delay feedback loop that previously caused trembling / oscillation.
+SERVO_PID_KP = 9.0    # Proportional gain on normalized error [-1, 1]
+SERVO_PID_KI = 0.0    # Integral disabled (avoids windup; not needed for pan)
+SERVO_PID_KD = 2.0    # Light derivative on the smoothed error (damping)
+SERVO_PID_I_CLAMP = 8.0  # Max absolute integral contribution (deg) if KI used
 
 # Rate limiting / smoothing
-SERVO_MAX_SPEED = 20     # Max degrees the servo target may change per update
+# SERVO_MAX_SPEED = max degrees the target may change PER UPDATE. Small steps
+# give the "46,47,48..." incremental motion the spec requires and let the ESP
+# keep up without queueing commands.
+SERVO_MAX_SPEED = 5      # Max degrees per update (fast but smooth centering)
 MAX_SPEED = SERVO_MAX_SPEED  # Alias (Issue #7)
-SMOOTHING_FACTOR = 0.7   # EMA on raw error: higher = faster response (was 0.5)
-SERVO_OUTPUT_SMOOTHING = 0.30  # EMA alpha on the OUTPUT angle command (prevents jitter)
+SMOOTHING_FACTOR = 0.45  # EMA on raw error: lower = smoother (less jitter)
+SERVO_OUTPUT_SMOOTHING = 0.55  # EMA alpha on the OUTPUT angle command
 SERVO_STEP_SIZE = 5      # Manual nudge step (left/right keys, command mode)
 SERVO_MAX_PAN_OFFSET = 90  # Max degrees from center when tracking
 
-# Dead zone: servo holds only when face is within this many pixels of frame center.
-CENTER_DEAD_ZONE = 20  # Pixels (was 25 — tighter so servo chases sooner)
+# ----------------------------------------------------------------------------
+# CENTERING DEAD-BAND — the ONLY condition under which the servo may stop.
+# ----------------------------------------------------------------------------
+# The servo stops ONLY when a detected, locked face is within CENTER_DEADBAND
+# pixels of the frame centre. Off-centre by more than this => KEEP MOVING.
+CENTER_DEADBAND = 30          # Pixels: |error| <= this == "centered" -> stop
+# Tiny hysteresis so the servo does not chatter exactly on the boundary: once
+# centred it resumes chasing only after the face drifts past this wider band.
+CENTER_DEADBAND_RESUME = 40   # Pixels: resume tracking once |error| exceeds this
+# Backwards-compatible aliases.
+CENTER_DEAD_ZONE = CENTER_DEADBAND
+CENTER_DEAD_ZONE_OUTER = CENTER_DEADBAND_RESUME
 SERVO_DEAD_ZONE_NORMALIZED = 0.06  # Legacy normalized fallback
 
 # ----------------------------------------------------------------------------
@@ -246,20 +293,47 @@ TRACKING_MOVEMENT_THRESHOLD = 0.05
 # ----------------------------------------------------------------------------
 # LOST-TARGET SEARCH & REACQUISITION (Issues #4, #5)
 # ----------------------------------------------------------------------------
-LOST_TARGET_TIMEOUT = 0.3        # Seconds target may be missing (track gone) before SEARCH
+LOST_TARGET_TIMEOUT = 0.0        # Enter SEARCH immediately when target leaves frame (no servo freeze)
 LOST_TARGET_FRAMES = 4           # Frames a track may be missing before it is dropped
 # If locked track stays visible but is unrecognized for this long → treat as lost
 LOST_TARGET_UNRECOGNIZED_SEC = 1.5
 
-# Search sweep — full 0°–180° coverage
+# Search sweep — full 0°–180° coverage, CONTINUOUS, never pausing.
+#
+# Primary path: the ESP firmware generates the sweep ON-BOARD (autonomous,
+# perfectly smooth, immune to MQTT/WiFi timing, reverses instantly at the
+# edges). The PC only sends the "search" command. FLASH THE FIRMWARE for this.
+#
+# Fallback path (firmware without autonomous search): the PC streams small,
+# dense angle waypoints so motion stays as smooth as possible.
 SEARCH_MIN_ANGLE = 0
 SEARCH_MAX_ANGLE = 180
-SEARCH_SWEEP_SPEED = 120.0       # Degrees per second (was 100 — faster search)
-SEARCH_SWEEP_STEP = 8            # Degrees per step (was 10 — finer steps)
-SEARCH_START_DIRECTION = "last"  # "last" | "left" | "right" — where to look first
-SEARCH_EXPAND_ENABLED = True     # Expand outward from last-known angle before full sweep
-SEARCH_REACQUIRE_FRAMES = 2      # Frames the original target must be re-seen to re-lock
-SEARCH_ENDPOINT_DWELL_SEC = 0.15 # Pause at each sweep edge for camera to settle (was 0.2)
+
+# --- Search sweep parameters -------------------------------------------------
+# The sweep runs in a background daemon thread, completely independent of the
+# camera frame rate, recognition speed, or MQTT publish timing.
+#
+#   SEARCH_STEP            degrees per step  (2° → smooth, no large skips)
+#   SEARCH_UPDATE_INTERVAL seconds between steps (thread sleep interval)
+#   SEARCH_SPEED           effective speed = SEARCH_STEP / SEARCH_UPDATE_INTERVAL
+#
+# Default: 2° every 14 ms ≈ 143 °/s. 0° → 180° in ~1.26 s.
+SEARCH_STEP = 2                  # degrees per waypoint
+SEARCH_UPDATE_INTERVAL = 0.014   # seconds between waypoints (14 ms)
+SEARCH_SPEED = SEARCH_STEP / SEARCH_UPDATE_INTERVAL   # ~142.8 °/s (informational)
+# Legacy aliases
+SEARCH_SWEEP_SPEED = SEARCH_SPEED
+SEARCH_SWEEP_STEP = SEARCH_STEP
+SEARCH_PC_SWEEP_STEP = SEARCH_STEP
+
+SEARCH_REACQUIRE_FRAMES = 2      # Confirmed frames before re-locking
+SEARCH_ENDPOINT_DWELL_SEC = 0.0  # NEVER dwell at edges — reversal is instant
+# Kept for backward compatibility only (not used by the thread-based sweep)
+SEARCH_CMD_RESEND_SEC = 1.0
+SEARCH_FALLBACK_DETECT_SEC = 0.4
+SEARCH_ESP_MOTION_DELTA = 3
+SEARCH_START_DIRECTION = "last"
+SEARCH_EXPAND_ENABLED = False
 
 # Legacy fixed sweep (used only if SEARCH_EXPAND_ENABLED is False)
 FRAMES_BEFORE_SEARCH = 24

@@ -15,7 +15,8 @@ function showLoadError(msg) {
 function stateClass(state) {
   const s = (state || "IDLE").toLowerCase();
   if (s === "locked") return "locked";
-  if (s === "searching") return "searching";
+  if (s === "searching" || s === "lost_target") return "searching";
+  if (s === "reacquiring") return "tracking";
   if (s === "tracking") return "tracking";
   return "idle";
 }
@@ -50,10 +51,15 @@ function renderStatus(data) {
 
   const lost = data.lost_for ?? 0;
   $("lost-for").textContent =
-    data.state === "SEARCHING" || lost > 0 ? `${lost.toFixed(1)}s` : "—";
+    ["SEARCHING", "LOST_TARGET", "REACQUIRING"].includes(data.state) || lost > 0
+      ? `${lost.toFixed(1)}s`
+      : "—";
 
   const banner = $("search-banner");
-  if (data.state === "SEARCHING" && data.lock_name) {
+  if (
+    ["SEARCHING", "LOST_TARGET", "REACQUIRING"].includes(data.state) &&
+    data.lock_name
+  ) {
     banner.textContent = `SEARCHING: ${data.lock_name}`;
     banner.classList.remove("hidden");
   } else {
