@@ -218,8 +218,12 @@ def main(
             print("  Fix: run python test_mqtt_system.py  OR  python test_simple_tracking.py")
             print("  Check: broker IP reachable, ESP8266 on same WiFi, firmware flashed.")
         else:
+            # start_tracking is sent automatically by _on_connect; center() is
+            # the first motion command of the new session.  The ESP will process
+            # it after its startup ignore window expires (if just rebooted) or
+            # immediately if already past the window.
             mqtt.center()
-            print("✓ MQTT ready — servo centered to start")
+            print("✓ MQTT ready — tracking session active, servo centering")
     tracker = FaceTracker()
     tlog = TrackingLogger(dashboard=dashboard)
     pan = PanTracker(mqtt=mqtt, logger=tlog)
@@ -616,8 +620,13 @@ def main(
                 threshold = max(0.0, threshold - 0.01)
 
     finally:
-        # Stop ALL servo motion FIRST so the camera does not keep sweeping
-        # after the tracking process is stopped (q / Ctrl-C / window close).
+        # ── Shutdown order ────────────────────────────────────────────────
+        # 1. pan.shutdown(): stops PC sweep thread, sends go_idle() + stop_session()
+        #    which publishes track + hold_angle + stop_tracking to the ESP.
+        # 2. mqtt.close(): sends stop_tracking again (idempotent), flushes the
+        #    paho queue so all QOS-1 messages are delivered, then disconnects.
+        #    On a clean disconnect the broker suppresses the LWT — the explicit
+        #    stop_tracking we sent is the definitive shutdown signal.
         try:
             pan.shutdown()
         except Exception as exc:

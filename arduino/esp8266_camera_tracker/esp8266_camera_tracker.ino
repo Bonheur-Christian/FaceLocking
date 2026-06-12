@@ -4,39 +4,71 @@
  * Controls a pan servo that tracks a locked face based on MQTT commands from
  * the Python face-recognition system.
  *
- * ----------------------------------------------------------------------------
- * SERVO STATE MACHINE (runs in loop(), INDEPENDENT of MQTT arrival timing)
- * ----------------------------------------------------------------------------
- *   MODE_IDLE    : DEFAULT state at power-up. Servo is stationary and holds
- *                  its initialised angle. NO tracking, NO sweeping. The servo
- *                  only leaves IDLE after a VALID command arrives from the PC.
- *   MODE_TRACK   : smoothly drive currentAngle -> targetAngle (1 deg / step).
+ * ============================================================================
+ * STATE MACHINE
+ * ============================================================================
+ *
+ *  BOOT
+ *   └─> INITIALIZE  (WiFi + MQTT setup)
+ *        └─> IDLE   (default; servo stationary at center angle)
+ *                 │
+ *            [start_tracking received]
+ *                 │
+ *              SESSION ACTIVE
+ *              ┌──────────────────────────────┐
+ *              │  IDLE     : no motion         │
+ *              │  TRACKING : servo → target    │
+ *              │  SEARCHING: autonomous sweep  │
+ *              │  CENTERED : servo holds       │
+ *              └──────────────────────────────┘
+ *                 │
+ *            [stop_tracking / watchdog / crash LWT]
+ *                 │
+ *              IDLE  (servo freezes immediately, no sweep)
+ *
+ * ============================================================================
+ * SERVO MODES (runs in loop(), INDEPENDENT of MQTT arrival timing)
+ * ============================================================================
+ *   MODE_IDLE    : DEFAULT state.  Servo is completely stationary. No tracking,
+ *                  no sweeping.  Servo only leaves IDLE after a valid command
+ *                  arrives inside an ACTIVE SESSION.
+ *   MODE_TRACK   : Smoothly drive currentAngle -> targetAngle (1 deg / step).
  *                  targetAngle is set by the PC on `camera/track/horizontal`.
- *   MODE_SEARCH  : autonomous continuous sweep 0 -> 180 -> 0 -> 180 ... with
- *                  small incremental steps. Started by the PC sending the
- *                  command "search". The sweep is generated ON THE ESP, so it
- *                  is perfectly smooth regardless of WiFi/MQTT jitter or loss.
+ *   MODE_SEARCH  : Autonomous continuous sweep 0 -> 180 -> 0 -> 180 ...
+ *                  Started by the PC sending "search". Motion is generated
+ *                  ON THE ESP so it is smooth regardless of MQTT jitter.
  *
- * Any horizontal angle command, or "track"/"center"/"left"/"right", switches
- * the servo back to MODE_TRACK. This is what stops the sweep the instant the
- * PC re-acquires the target.
+ * ============================================================================
+ * SESSION MANAGEMENT
+ * ============================================================================
+ *   - ESP ignores ALL motion commands until a valid session is active.
+ *   - Session activated by "start_tracking" command on camera/track/command.
+ *   - Session terminated by "stop_tracking" command (or LWT from PC crash).
+ *   - Watchdog: if no command arrives for SESSION_WATCHDOG_MS, session ends
+ *     and servo returns to IDLE automatically.
+ *   - Session commands ("start_tracking" / "stop_tracking") are accepted even
+ *     during the STARTUP_IGNORE_MS window so the PC can activate promptly.
  *
+ * ============================================================================
  * STARTUP SAFETY
- * ----------------------------------------------------------------------------
- *   - Default mode is MODE_IDLE (no motion).
- *   - On connect the ESP CLEARS any retained messages on its command topics
- *     and then ignores ALL inbound messages for STARTUP_IGNORE_MS so that
- *     retained / stale / startup messages can never move the servo.
+ * ============================================================================
+ *   - Default mode: MODE_IDLE, sessionActive: false (no motion).
+ *   - On connect, ESP clears retained messages on command topics BEFORE
+ *     subscribing, so retained/stale messages can never move the servo.
+ *   - All inbound messages (except session commands) are dropped for
+ *     STARTUP_IGNORE_MS after subscribing to absorb broker-queued messages.
  *   - Empty / non-numeric / out-of-range messages are rejected.
+ *   - Random client ID prevents QOS-1 message replay from previous sessions.
  *
  * Hardware:
- * - ESP8266 (NodeMCU / Wemos D1 Mini)
- * - Servo on SERVO_PIN, VCC 5V, common GND
+ *   - ESP8266 (NodeMCU / Wemos D1 Mini)
+ *   - Servo on SERVO_PIN, VCC 5V, common GND
  *
  * MQTT Topics:
- * - camera/track/horizontal : target angle 0-180 (plain int or {"angle":N})
- * - camera/track/command    : "search" | "track" | "center" | "left" | "right"
- * - camera/status           : ESP publishes {"angle":N,"target":N,"mode":"..."}
+ *   - camera/track/horizontal : target angle 0-180
+ *   - camera/track/command    : "start_tracking" | "stop_tracking" | "search"
+ *                               "track" | "center" | "left" | "right" | "idle"
+ *   - camera/status           : ESP publishes status JSON
  */
 
 #include <ESP8266WiFi.h>
@@ -59,30 +91,31 @@ const char* mqtt_user = "";
 const char* mqtt_password = "";
 
 const char* topic_horizontal = "camera/track/horizontal";
-const char* topic_command = "camera/track/command";
-const char* topic_status = "camera/status";
+const char* topic_command    = "camera/track/command";
+const char* topic_status     = "camera/status";
 
 // Servo settings
-const int SERVO_PIN = 12;  // GPIO12
-const int SERVO_MIN_ANGLE = 0;
-const int SERVO_MAX_ANGLE = 180;
+const int SERVO_PIN         = 12;   // GPIO12
+const int SERVO_MIN_ANGLE   = 0;
+const int SERVO_MAX_ANGLE   = 180;
 const int SERVO_CENTER_ANGLE = 90;
-const int SERVO_STEP_SIZE = 10;  // nudge step for left/right commands
+const int SERVO_STEP_SIZE   = 10;   // nudge step for left/right commands
 
-// Motion timing — one degree every N ms gives smooth, jitter-free motion.
-// Lower = faster. 7ms/deg ~= 140 deg/s: fast target acquisition, still smooth.
-const unsigned long SERVO_TRACK_STEP_MS = 7;    // ~140 deg/s while tracking
-const unsigned long SERVO_SEARCH_STEP_MS = 7;   // ~140 deg/s while sweeping
+// Motion timing — 1 degree every N ms gives smooth, jitter-free motion.
+// 7ms/deg ≈ 140 deg/s: fast target acquisition, still smooth.
+const unsigned long SERVO_TRACK_STEP_MS  = 7;
+const unsigned long SERVO_SEARCH_STEP_MS = 7;
 
 // Debug — event-level logging only (state changes, commands, movement reasons).
-// Safe to leave ON: we never print inside the per-degree servo step, so the
-// motion loop is not stalled.
 #define DEBUG true
 
-// Ignore ALL inbound MQTT messages for this long after (re)subscribing. The
-// broker delivers retained messages immediately on subscribe, so this window
-// guarantees retained/stale/startup messages cannot move the servo at boot.
+// Ignore non-session MQTT messages for this long after (re)subscribing.
+// Guarantees retained/stale/startup messages cannot move the servo at boot.
 const unsigned long STARTUP_IGNORE_MS = 2000;
+
+// Session watchdog: if no valid command arrives for this long the session is
+// considered dead and the servo returns to IDLE automatically.
+const unsigned long SESSION_WATCHDOG_MS = 5000;
 
 // ============================================================================
 // STATE
@@ -90,23 +123,32 @@ const unsigned long STARTUP_IGNORE_MS = 2000;
 
 enum ServoMode { MODE_IDLE, MODE_TRACK, MODE_SEARCH };
 
-WiFiClient espClient;
+WiFiClient   espClient;
 PubSubClient client(espClient);
-Servo cameraServo;
+Servo        cameraServo;
 
-// DEFAULT STATE = IDLE: the servo stays put until a valid PC command arrives.
-ServoMode mode = MODE_IDLE;
-int currentAngle = SERVO_CENTER_ANGLE;
-int targetAngle = SERVO_CENTER_ANGLE;
-int sweepDir = 1;  // +1 -> moving toward MAX, -1 -> moving toward MIN
+// Servo state
+ServoMode    mode         = MODE_IDLE;
+int          currentAngle = SERVO_CENTER_ANGLE;
+int          targetAngle  = SERVO_CENTER_ANGLE;
+int          sweepDir     = 1;   // +1 toward MAX, -1 toward MIN
 
-unsigned long lastServoStepMs = 0;
-unsigned long lastStatusUpdate = 0;
-unsigned long lastReconnectAttemptMs = 0;
-unsigned long subscribeMs = 0;        // when we last (re)subscribed
-bool commandAccepted = false;         // true once a valid command has activated motion
-const unsigned long STATUS_UPDATE_INTERVAL = 250;  // keep PC angle estimate fresh
+// Session state — the ONLY gate that allows motion commands through
+bool         sessionActive       = false;
+unsigned long lastSessionCommandMs = 0;
+
+// Timing
+unsigned long lastServoStepMs          = 0;
+unsigned long lastStatusUpdate         = 0;
+unsigned long lastReconnectAttemptMs   = 0;
+unsigned long subscribeMs              = 0;   // when last (re)subscribed
+
+const unsigned long STATUS_UPDATE_INTERVAL    = 250;
 const unsigned long MQTT_RECONNECT_INTERVAL_MS = 3000;
+
+// ============================================================================
+// HELPERS
+// ============================================================================
 
 const char* modeName(ServoMode m) {
   switch (m) {
@@ -123,12 +165,19 @@ void logState(const char* event) {
   Serial.print(millis());
   Serial.print("ms] ");
   Serial.print(event);
-  Serial.print(" | state=");
+  Serial.print(" | session=");
+  Serial.print(sessionActive ? "ON" : "OFF");
+  Serial.print(" state=");
   Serial.print(modeName(mode));
   Serial.print(" angle=");
   Serial.print(currentAngle);
   Serial.print(" target=");
   Serial.println(targetAngle);
+}
+
+// True while the startup/retained ignore window is active.
+bool inStartupIgnoreWindow() {
+  return (millis() - subscribeMs) < STARTUP_IGNORE_MS;
 }
 
 // ============================================================================
@@ -142,21 +191,22 @@ void setup() {
   Serial.println("ESP8266 Camera Tracker Starting");
   Serial.println("=================================\n");
 
-  // One-time fixed-angle initialisation to the centre, then HOLD (IDLE).
+  // Initialise servo to centre, then HOLD (IDLE). No session active.
   cameraServo.attach(SERVO_PIN);
   cameraServo.write(SERVO_CENTER_ANGLE);
   currentAngle = SERVO_CENTER_ANGLE;
-  targetAngle = SERVO_CENTER_ANGLE;
-  mode = MODE_IDLE;                 // default: stationary, no track, no search
-  commandAccepted = false;
-  lastServoStepMs = millis();
-  logState("boot: servo initialised to center, IDLE");
+  targetAngle  = SERVO_CENTER_ANGLE;
+  mode         = MODE_IDLE;
+  sessionActive = false;
+  lastSessionCommandMs = millis();
+  lastServoStepMs      = millis();
+  logState("BOOT: servo at center, IDLE, no session");
 
   setup_wifi();
   client.setServer(mqtt_server, mqtt_port);
   client.setCallback(mqtt_callback);
 
-  Serial.println("\nSetup complete. IDLE — waiting for a valid PC command.\n");
+  Serial.println("\nSetup complete. IDLE — waiting for START_TRACKING from PC.\n");
 }
 
 // ============================================================================
@@ -189,35 +239,42 @@ void setup_wifi() {
 // ============================================================================
 
 void ensureMqttConnected() {
-  if (client.connected()) {
-    return;
-  }
+  if (client.connected()) return;
+
   unsigned long now = millis();
-  if (now - lastReconnectAttemptMs < MQTT_RECONNECT_INTERVAL_MS) {
-    return;
-  }
+  if (now - lastReconnectAttemptMs < MQTT_RECONNECT_INTERVAL_MS) return;
   lastReconnectAttemptMs = now;
 
   Serial.print("Connecting to MQTT broker...");
+
+  // Random client ID prevents broker from replaying QOS-1 messages from a
+  // previous session to us when we reconnect after a reboot.
   String clientId = "ESP8266_CameraTracker_";
   clientId += String(random(0xffff), HEX);
 
   if (client.connect(clientId.c_str(), mqtt_user, mqtt_password)) {
     Serial.println(" connected!");
 
-    // Clear any RETAINED messages on the command topics BEFORE subscribing, so
-    // a stale retained "search"/angle from a previous session cannot be
-    // replayed to us and start motion at boot. An empty retained payload
-    // deletes the broker's retained message.
+    // Clear any RETAINED messages on command topics BEFORE subscribing.
+    // An empty retained payload deletes the broker's stored message so a
+    // stale retained "search"/angle from a previous session cannot replay.
     client.publish(topic_horizontal, "", true);
-    client.publish(topic_command, "", true);
+    client.publish(topic_command,    "", true);
 
     client.subscribe(topic_horizontal);
     client.subscribe(topic_command);
 
+    // Reset session: a new MQTT connection means we lost the previous session
+    // (e.g. ESP rebooted). The PC will re-send start_tracking from its
+    // _on_connect callback, re-establishing the session cleanly.
+    sessionActive = false;
+    lastSessionCommandMs = millis();
+
     // Begin the startup ignore window: drop everything for STARTUP_IGNORE_MS.
+    // Session commands ("start_tracking"/"stop_tracking") are still accepted
+    // during this window so the PC can activate promptly.
     subscribeMs = millis();
-    logState("mqtt connected: cleared retained, subscribed, ignoring inbound msgs");
+    logState("MQTT connected: cleared retained, subscribed, waiting for session");
 
     publishStatus();
   } else {
@@ -230,8 +287,6 @@ void ensureMqttConnected() {
 // MESSAGE PARSING
 // ============================================================================
 
-// Returns a valid angle [0..180], or -1 if the message is empty / non-numeric /
-// malformed. NOTE: a plain "0" is valid, but "" or "abc" must NOT become 0.
 bool isNumericString(const String& s) {
   if (s.length() == 0) return false;
   for (unsigned int i = 0; i < s.length(); i++) {
@@ -245,7 +300,7 @@ bool isNumericString(const String& s) {
 int parseAngleFromMessage(const String& message) {
   String trimmed = message;
   trimmed.trim();
-  if (trimmed.length() == 0) return -1;          // reject empty/retained-cleared
+  if (trimmed.length() == 0) return -1;
   if (trimmed.startsWith("{")) {
     int keyPos = trimmed.indexOf("\"angle\"");
     if (keyPos >= 0) {
@@ -253,10 +308,10 @@ int parseAngleFromMessage(const String& message) {
       if (colonPos >= 0) {
         String num = trimmed.substring(colonPos + 1);
         num.trim();
-        // Strip any trailing JSON punctuation.
         int end = 0;
         while (end < (int)num.length() &&
-               (isDigit(num.charAt(end)) || (end == 0 && (num.charAt(0) == '-' || num.charAt(0) == '+')))) {
+               (isDigit(num.charAt(end)) ||
+                (end == 0 && (num.charAt(0) == '-' || num.charAt(0) == '+')))) {
           end++;
         }
         num = num.substring(0, end);
@@ -266,7 +321,7 @@ int parseAngleFromMessage(const String& message) {
     }
     return -1;
   }
-  if (!isNumericString(trimmed)) return -1;       // reject non-numeric plain text
+  if (!isNumericString(trimmed)) return -1;
   return trimmed.toInt();
 }
 
@@ -279,7 +334,7 @@ String parseCommandFromMessage(const String& message) {
       int colonPos = trimmed.indexOf(':', keyPos);
       if (colonPos >= 0) {
         int quoteStart = trimmed.indexOf('"', colonPos + 1);
-        int quoteEnd = trimmed.indexOf('"', quoteStart + 1);
+        int quoteEnd   = trimmed.indexOf('"', quoteStart + 1);
         if (quoteStart >= 0 && quoteEnd > quoteStart) {
           return trimmed.substring(quoteStart + 1, quoteEnd);
         }
@@ -290,33 +345,37 @@ String parseCommandFromMessage(const String& message) {
   return trimmed;
 }
 
-// Switch to tracking mode aimed at a specific angle.
+// ============================================================================
+// STATE TRANSITIONS
+// ============================================================================
+
 void enterTrackMode(int angle) {
   angle = constrain(angle, SERVO_MIN_ANGLE, SERVO_MAX_ANGLE);
   targetAngle = angle;
-  commandAccepted = true;
+  lastSessionCommandMs = millis();  // feed watchdog
   if (mode != MODE_TRACK) {
     mode = MODE_TRACK;
-    logState("-> MODE_TRACK (valid command)");
+    logState("-> MODE_TRACK");
     publishStatus();
   }
 }
 
 void enterSearchMode() {
-  commandAccepted = true;
+  lastSessionCommandMs = millis();  // feed watchdog
   if (mode != MODE_SEARCH) {
     mode = MODE_SEARCH;
-    // Continue sweeping from the current physical position; pick the direction
-    // with the most travel room so we never start by slamming an endpoint.
     sweepDir = (currentAngle <= (SERVO_MIN_ANGLE + SERVO_MAX_ANGLE) / 2) ? 1 : -1;
-    logState("-> MODE_SEARCH (valid command)");
+    logState("-> MODE_SEARCH");
     publishStatus();
   }
 }
 
-// True while the startup/retained ignore window is active.
-bool inStartupIgnoreWindow() {
-  return (millis() - subscribeMs) < STARTUP_IGNORE_MS;
+void enterIdleMode(const char* reason) {
+  sessionActive = false;
+  mode          = MODE_IDLE;
+  targetAngle   = currentAngle;   // freeze at current physical position
+  logState(reason);
+  publishStatus();
 }
 
 // ============================================================================
@@ -339,20 +398,58 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
     Serial.println("'");
   }
 
-  // 1) Reject empty payloads (includes our own retained-clear publishes).
+  // ── 1) Reject empty payloads (includes our own retained-clear publishes) ──
   if (length == 0 || message.length() == 0) {
     if (DEBUG) Serial.println("   ignored: empty message");
     return;
   }
 
-  // 2) Startup / retained guard: ignore everything in the ignore window so a
-  //    retained or stale message delivered at connect cannot move the servo.
+  // ── 2) SESSION CONTROL — accepted even during the startup ignore window ──
+  //    These commands are the ONLY ones that bypass both the startup guard
+  //    and the session gate, so the PC can activate/deactivate at any time.
+  if (strcmp(topic, topic_command) == 0) {
+    String cmd = parseCommandFromMessage(message);
+    cmd.toLowerCase();
+    cmd.trim();
+
+    if (cmd == "start_tracking") {
+      // Activate session: servo is now allowed to receive motion commands.
+      // Mode stays IDLE until the first real motion command arrives.
+      sessionActive        = true;
+      lastSessionCommandMs = millis();
+      mode                 = MODE_IDLE;   // hold until first real command
+      targetAngle          = currentAngle;
+      if (DEBUG) Serial.println("   SESSION STARTED -> waiting for motion commands");
+      logState("-> SESSION ACTIVE (start_tracking)");
+      publishStatus();
+      return;
+    }
+
+    if (cmd == "stop_tracking") {
+      // Deactivate session immediately: freeze servo, return to IDLE.
+      // This is also sent as Last Will Testament by the PC on crash.
+      if (DEBUG) Serial.println("   SESSION STOPPED -> IDLE");
+      enterIdleMode("-> SESSION ENDED (stop_tracking)");
+      return;
+    }
+  }
+
+  // ── 3) Startup / retained guard: drop everything except session commands ──
   if (inStartupIgnoreWindow()) {
-    if (DEBUG) Serial.println("   ignored: startup/retained guard window");
+    if (DEBUG) Serial.println("   ignored: startup guard window active");
     return;
   }
 
-  // Horizontal angle => always tracking mode toward that angle.
+  // ── 4) Session gate: no session → no motion ──────────────────────────────
+  if (!sessionActive) {
+    if (DEBUG) Serial.println("   ignored: no active tracking session");
+    return;
+  }
+
+  // ── 5) Valid command inside an active session — feed the watchdog ─────────
+  lastSessionCommandMs = millis();
+
+  // ── 6) Horizontal angle → always tracking mode toward that angle ──────────
   if (strcmp(topic, topic_horizontal) == 0) {
     int angle = parseAngleFromMessage(message);
     if (angle < SERVO_MIN_ANGLE || angle > SERVO_MAX_ANGLE) {
@@ -360,7 +457,7 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
       return;
     }
     if (DEBUG) {
-      Serial.print("   cmd=angle ");
+      Serial.print("   angle=");
       Serial.print(angle);
       Serial.println(" -> TRACK");
     }
@@ -368,7 +465,7 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
     return;
   }
 
-  // Commands.
+  // ── 7) Command string ─────────────────────────────────────────────────────
   if (strcmp(topic, topic_command) == 0) {
     String command = parseCommandFromMessage(message);
     command.toLowerCase();
@@ -387,11 +484,12 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
     if (command == "search" || command == "sweep") {
       enterSearchMode();
     } else if (command == "track" || command == "stop") {
-      enterTrackMode(currentAngle);  // hold here, stop sweeping
+      enterTrackMode(currentAngle);   // hold here, cancel sweep
     } else if (command == "center") {
       enterTrackMode(SERVO_CENTER_ANGLE);
     } else if (command == "idle") {
-      mode = MODE_IDLE;              // explicit park: stop all motion, hold
+      // Explicit park within session (stops motion but keeps session alive).
+      mode        = MODE_IDLE;
       targetAngle = currentAngle;
       logState("-> MODE_IDLE (command)");
       publishStatus();
@@ -412,16 +510,11 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
 void updateServo() {
   unsigned long now = millis();
 
-  // IDLE: servo is completely stationary. No writes, no tracking, no sweep.
-  // The servo holds whatever angle it was initialised/left at.
-  if (mode == MODE_IDLE) {
-    return;
-  }
+  // IDLE: completely stationary. No writes, no tracking, no sweep.
+  if (mode == MODE_IDLE) return;
 
   if (mode == MODE_SEARCH) {
-    if (now - lastServoStepMs < SERVO_SEARCH_STEP_MS) {
-      return;
-    }
+    if (now - lastServoStepMs < SERVO_SEARCH_STEP_MS) return;
     lastServoStepMs = now;
 
     currentAngle += sweepDir;
@@ -437,12 +530,8 @@ void updateServo() {
   }
 
   // MODE_TRACK
-  if (currentAngle == targetAngle) {
-    return;
-  }
-  if (now - lastServoStepMs < SERVO_TRACK_STEP_MS) {
-    return;
-  }
+  if (currentAngle == targetAngle) return;
+  if (now - lastServoStepMs < SERVO_TRACK_STEP_MS) return;
   lastServoStepMs = now;
 
   currentAngle += (currentAngle < targetAngle) ? 1 : -1;
@@ -454,16 +543,35 @@ void updateServo() {
 }
 
 // ============================================================================
+// SESSION WATCHDOG — runs every loop()
+// ============================================================================
+
+void checkSessionWatchdog() {
+  if (!sessionActive) return;
+  unsigned long now = millis();
+  if (now - lastSessionCommandMs > SESSION_WATCHDOG_MS) {
+    Serial.print("[");
+    Serial.print(now);
+    Serial.print("ms] WATCHDOG: no command for ");
+    Serial.print(SESSION_WATCHDOG_MS);
+    Serial.println("ms -> session ended, returning to IDLE");
+    enterIdleMode("-> WATCHDOG TIMEOUT -> IDLE");
+  }
+}
+
+// ============================================================================
 // PUBLISH STATUS
 // ============================================================================
 
 void publishStatus() {
   bool moving = (mode == MODE_SEARCH) ||
                 (mode == MODE_TRACK && currentAngle != targetAngle);
-  String status = "{\"angle\":" + String(currentAngle) +
-                  ",\"target\":" + String(targetAngle) +
-                  ",\"mode\":\"" + String(modeName(mode)) + "\"" +
-                  ",\"moving\":" + (moving ? "true" : "false") + "}";
+  String status =
+      "{\"angle\":"   + String(currentAngle) +
+      ",\"target\":"  + String(targetAngle) +
+      ",\"mode\":\""  + String(modeName(mode)) + "\"" +
+      ",\"moving\":"  + (moving ? "true" : "false") +
+      ",\"session\":" + (sessionActive ? "true" : "false") + "}";
   client.publish(topic_status, status.c_str());
 }
 
@@ -474,6 +582,9 @@ void publishStatus() {
 void loop() {
   ensureMqttConnected();
   client.loop();
+
+  // Check watchdog before running servo to stop immediately if timed out.
+  checkSessionWatchdog();
 
   updateServo();
 

@@ -227,6 +227,13 @@ MQTT_KEEPALIVE = 30
 MQTT_QOS = 1
 MQTT_MIN_COMMAND_INTERVAL_MS = 20  # Tracking rate limiter (~50 cmds/sec max)
 
+# Session management
+# The PC sends START_TRACKING on connect and STOP_TRACKING on exit (or the
+# broker delivers STOP_TRACKING via Last Will on a crash).  The ESP ignores
+# all motion commands until an active session is established.
+MQTT_TOPIC_SESSION = "camera/track/command"  # session cmds share the command topic
+SESSION_WATCHDOG_SEC = 5      # ESP returns to IDLE if silent for this many seconds
+
 # ----------------------------------------------------------------------------
 # SERVO CONTROL (must match ESP8266 firmware limits)
 # ----------------------------------------------------------------------------
@@ -269,10 +276,17 @@ SERVO_MAX_PAN_OFFSET = 90  # Max degrees from center when tracking
 # ----------------------------------------------------------------------------
 # The servo stops ONLY when a detected, locked face is within CENTER_DEADBAND
 # pixels of the frame centre. Off-centre by more than this => KEEP MOVING.
-CENTER_DEADBAND = 30          # Pixels: |error| <= this == "centered" -> stop
-# Tiny hysteresis so the servo does not chatter exactly on the boundary: once
-# centred it resumes chasing only after the face drifts past this wider band.
-CENTER_DEADBAND_RESUME = 40   # Pixels: resume tracking once |error| exceeds this
+CENTER_DEADBAND = 35          # Pixels: |error| <= this == "centered" -> stop
+# Hysteresis: once centred, resume chasing only after the face drifts past
+# this wider band. Prevents servo chatter at the deadband boundary.
+CENTER_DEADBAND_RESUME = 55   # Pixels: resume tracking once |error| exceeds this
+# When truly LOCKED (center_locked=True), use a much larger resume threshold
+# to prevent face-detection jitter from causing any trembling at all. The servo
+# only wakes from a fully-locked hold if the face has genuinely moved far.
+LOCKED_DEADBAND_RESUME = 85   # Pixels: resume from LOCKED state only after this
+# Number of consecutive frames outside the resume band required before
+# releasing the hold. Prevents single-frame jitter spikes from waking the servo.
+HOLD_EXIT_FRAMES = 3
 # Backwards-compatible aliases.
 CENTER_DEAD_ZONE = CENTER_DEADBAND
 CENTER_DEAD_ZONE_OUTER = CENTER_DEADBAND_RESUME

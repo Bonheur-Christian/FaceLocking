@@ -57,6 +57,17 @@ class MQTTCameraController:
         if self.username and self.password:
             self.client.username_pw_set(self.username, self.password)
 
+        # Last Will and Testament — broker publishes this automatically if the
+        # PC client disconnects unexpectedly (crash, power loss, network drop).
+        # The ESP receives "stop_tracking" and immediately returns to IDLE,
+        # stopping all servo motion even if the PC never ran its finally block.
+        self.client.will_set(
+            self.topic_command,
+            "stop_tracking",
+            qos=1,
+            retain=False,
+        )
+
         self.client.on_connect = self._on_connect
         self.client.on_disconnect = self._on_disconnect
         self.client.on_message = self._on_message
@@ -73,7 +84,11 @@ class MQTTCameraController:
         if rc == 0:
             self.is_connected = True
             client.subscribe(self.topic_status, qos=config.MQTT_QOS)
-            print(f"✓ MQTT connected, subscribed to {self.topic_status}")
+            # Send START_TRACKING on every (re)connect so the ESP activates its
+            # session gate as soon as the PC is live.  The ESP accepts this
+            # command even during its startup ignore window.
+            client.publish(self.topic_command, "start_tracking", qos=config.MQTT_QOS)
+            print(f"✓ MQTT connected — session start sent to ESP")
         else:
             print(f"✗ MQTT connect failed rc={rc}")
 
@@ -241,10 +256,54 @@ class MQTTCameraController:
                 self._last_publish_ms = time.time() * 1000.0
             return ok
 
+    def start_session(self) -> bool:
+        """
+        Explicitly activate the ESP tracking session.
+
+        The ESP will ignore all motion commands (angles, search, center, etc.)
+        until a session is active.  This is also sent automatically from the
+        _on_connect callback on every (re)connect.
+        """
+        if not self.is_connected:
+            return False
+        with self._publish_lock:
+            result = self.client.publish(
+                self.topic_command, "start_tracking", qos=config.MQTT_QOS,
+            )
+        ok = result.rc == mqtt.MQTT_ERR_SUCCESS
+        if ok:
+            print("✓ Tracking session started — ESP will accept motion commands")
+        return ok
+
+    def stop_session(self) -> bool:
+        """
+        Terminate the ESP tracking session and freeze the servo immediately.
+
+        Sends STOP_TRACKING which the ESP processes even during its startup
+        ignore window.  The ESP returns to IDLE and stops all servo motion.
+        Called on graceful shutdown; also delivered automatically via LWT on
+        crash or unexpected disconnect.
+        """
+        self._search_requested = False
+        if not self.is_connected:
+            return False
+        with self._publish_lock:
+            result = self.client.publish(
+                self.topic_command, "stop_tracking", qos=config.MQTT_QOS,
+            )
+        ok = result.rc == mqtt.MQTT_ERR_SUCCESS
+        if ok:
+            print("✓ Tracking session stopped — ESP returned to IDLE")
+        return ok
+
     def go_idle(self, hold_angle: Optional[int] = None) -> bool:
         """
-        Park the servo: leave search/track, hold the current angle, and stop
+        Park the servo: end the session, freeze servo at hold_angle, and stop
         all motion. Sent on shutdown so the camera does not keep moving.
+
+        stop_session() is the primary mechanism; go_idle() also publishes a
+        hold angle beforehand so the servo freezes at a known good position
+        even on firmware that does not implement session management.
         """
         self._search_requested = False
         if not self.is_connected:
@@ -252,11 +311,11 @@ class MQTTCameraController:
         angle = hold_angle if hold_angle is not None else self.reported_angle
         angle = int(max(config.SERVO_MIN_ANGLE, min(config.SERVO_MAX_ANGLE, angle)))
         with self._publish_lock:
-            # "track" works on all firmware (stops sweep); "idle" parks on
-            # firmware that supports a dedicated IDLE state. Both are harmless.
-            self.client.publish(self.topic_command, "track", qos=config.MQTT_QOS)
-            self.client.publish(self.topic_horizontal, str(angle), qos=config.MQTT_QOS)
-            self.client.publish(self.topic_command, "idle", qos=config.MQTT_QOS)
+            # Stop sweep and freeze position first (works on all firmware).
+            self.client.publish(self.topic_command,    "track",           qos=config.MQTT_QOS)
+            self.client.publish(self.topic_horizontal, str(angle),        qos=config.MQTT_QOS)
+            # End the session (session-aware firmware ignores all further cmds).
+            self.client.publish(self.topic_command,    "stop_tracking",   qos=config.MQTT_QOS)
             self.commanded_angle = angle
         return True
 
@@ -289,10 +348,10 @@ class MQTTCameraController:
 
     def close(self) -> None:
         try:
-            # Final safety stop: ensure the ESP is parked and the command is
-            # flushed before we tear down the network loop.
-            self.go_idle()
-            self.flush(0.4)
+            # Stop session first (ends ESP motion + overrides LWT so broker
+            # does not also publish the LWT after a clean disconnect).
+            self.stop_session()
+            self.flush(0.5)
             self.client.loop_stop()
             self.client.disconnect()
         except Exception:

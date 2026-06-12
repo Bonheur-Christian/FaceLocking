@@ -60,6 +60,7 @@ class PanTracker:
         self.target_angle: float = float(config.SERVO_CENTER_ANGLE)
         self._smooth_angle: Optional[float] = None
         self._holding: bool = False
+        self._hold_exit_frames: int = 0   # consecutive frames outside resume band
         self.frames_in_center: int = 0
         self.center_locked: bool = False
         self.last_error_sign: int = 0
@@ -115,6 +116,7 @@ class PanTracker:
         self.target_angle = float(self.current_angle)
         self._smooth_angle = float(self.current_angle)
         self._holding = False
+        self._hold_exit_frames = 0
         self.frames_in_center = 0
         self.center_locked = False
         self.search_manual = False
@@ -143,6 +145,7 @@ class PanTracker:
         # acquisition re-evaluates the dead-band from scratch: it will move to
         # centre if the face is off-centre, or hold if already centred.
         self._holding = False
+        self._hold_exit_frames = 0
         self.frames_in_center = 0
         self.center_locked = False
         if self.mqtt:
@@ -288,18 +291,41 @@ class PanTracker:
             self.frames_in_center = 0
             self.center_locked = False
 
-        # ── Dead-band with hysteresis ─────────────────────────────────────
+        # ── Dead-band with hysteresis + trembling guard ────────────────────
         # _holding = True ONLY when inside CENTER_DEADBAND.
-        # Hysteresis: once centred, only resume when face drifts past
-        # CENTER_DEADBAND_RESUME, preventing chatter at the boundary.
+        #
+        # Resume threshold varies by lock state:
+        #   - LOCKED (center_locked): uses LOCKED_DEADBAND_RESUME (very wide)
+        #     so face-detection jitter never wakes the servo once truly locked.
+        #   - TRACKING (not yet locked): uses CENTER_DEADBAND_RESUME (normal).
+        #
+        # _hold_exit_frames counter: require HOLD_EXIT_FRAMES consecutive frames
+        # OUTSIDE the resume band before releasing hold.  A single jitter spike
+        # that crosses the band for one frame is ignored completely.
         if self._holding:
-            # Currently centred — resume chasing only if drifted far enough.
-            if err_px > config.CENTER_DEADBAND_RESUME:
-                self._holding = False
+            resume_px = (
+                config.LOCKED_DEADBAND_RESUME
+                if self.center_locked
+                else config.CENTER_DEADBAND_RESUME
+            )
+            if err_px > resume_px:
+                self._hold_exit_frames += 1
+                if self._hold_exit_frames >= config.HOLD_EXIT_FRAMES:
+                    # Enough consecutive frames outside band — resume tracking.
+                    self._holding = False
+                    self._hold_exit_frames = 0
+            else:
+                # Face returned inside band — reset exit counter.
+                self._hold_exit_frames = 0
         else:
             # Currently moving — stop only when inside the inner band.
             if err_px <= config.CENTER_DEADBAND:
                 self._holding = True
+                self._hold_exit_frames = 0
+                # Zero error state on entry to prevent a derivative spike when
+                # tracking resumes after hold (avoids initial overshoot).
+                self.smoothed_error = 0.0
+                self.prev_error = 0.0
 
         if self._holding:
             label = "centered" if self.center_locked else "tracking"
@@ -403,14 +429,19 @@ class PanTracker:
         """
         Stop ALL servo motion on program exit.
 
-        Halts the background sweep thread and commands the ESP to leave
-        search mode and hold its current angle, so the camera does not keep
-        sweeping after the tracking process is stopped.
+        Halts the background sweep thread, freezes the servo, and terminates
+        the ESP tracking session so the camera does not keep sweeping after
+        the tracking process is stopped.  go_idle() sends track+angle first
+        (for backward-compatible firmware), then stop_session() sends the
+        explicit STOP_TRACKING command to activate the session gate on the
+        ESP and guarantee IDLE state.
         """
         self._search_cancelled = True
         self.search_manual = False
         self._stop_sweep()
         if self.mqtt:
             hold_angle = int(round(self.current_angle))
-            self.mqtt.cancel_search(hold_angle)
             self.mqtt.go_idle(hold_angle)
+            # Explicitly end the session — servo will not move again until
+            # the PC sends start_tracking in a future session.
+            self.mqtt.stop_session()
