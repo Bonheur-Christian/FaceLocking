@@ -191,13 +191,55 @@ class MQTTCameraController:
             self._last_search_cmd_ms = now
         return ok
 
-    def stop_search(self) -> bool:
+    def stop_search(self, hold_angle: Optional[int] = None) -> bool:
         """Stop the ESP sweep and hold the current position (TRACK mode)."""
+        return self.cancel_search(hold_angle)
+
+    def cancel_search(self, hold_angle: Optional[int] = None) -> bool:
+        """
+        Atomically cancel search/sweep and freeze the servo.
+
+        Sends TRACK mode to the ESP (exits autonomous MODE_SEARCH) and publishes
+        a hold angle so the ESP stops chasing stale sweep waypoints immediately.
+        """
         self._search_requested = False
         if not self.is_connected:
             return False
-        result = self.client.publish(self.topic_command, "track", qos=config.MQTT_QOS)
-        return result.rc == mqtt.MQTT_ERR_SUCCESS
+        angle = hold_angle if hold_angle is not None else self.reported_angle
+        angle = int(max(config.SERVO_MIN_ANGLE, min(config.SERVO_MAX_ANGLE, angle)))
+        with self._publish_lock:
+            track_result = self.client.publish(
+                self.topic_command, "track", qos=config.MQTT_QOS,
+            )
+            hold_result = self.client.publish(
+                self.topic_horizontal, str(angle), qos=config.MQTT_QOS,
+            )
+            ok = (
+                track_result.rc == mqtt.MQTT_ERR_SUCCESS
+                and hold_result.rc == mqtt.MQTT_ERR_SUCCESS
+            )
+            if ok:
+                self.commanded_angle = angle
+                self._last_publish_ms = time.time() * 1000.0
+            return ok
+
+    def hold_at_angle(self, angle: int, force: bool = True) -> bool:
+        """Publish a single hold angle without changing search mode flags."""
+        angle = int(max(config.SERVO_MIN_ANGLE, min(config.SERVO_MAX_ANGLE, angle)))
+        with self._publish_lock:
+            if not force and angle == self.commanded_angle:
+                if abs(angle - self.reported_angle) <= 2:
+                    return False
+            if not self.is_connected:
+                return False
+            result = self.client.publish(
+                self.topic_horizontal, str(angle), qos=config.MQTT_QOS,
+            )
+            ok = result.rc == mqtt.MQTT_ERR_SUCCESS
+            if ok:
+                self.commanded_angle = angle
+                self._last_publish_ms = time.time() * 1000.0
+            return ok
 
     def move_left(self, step: int = None) -> bool:
         step = step or config.SERVO_STEP_SIZE

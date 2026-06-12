@@ -257,7 +257,7 @@ SERVO_PID_I_CLAMP = 8.0  # Max absolute integral contribution (deg) if KI used
 # SERVO_MAX_SPEED = max degrees the target may change PER UPDATE. Small steps
 # give the "46,47,48..." incremental motion the spec requires and let the ESP
 # keep up without queueing commands.
-SERVO_MAX_SPEED = 5      # Max degrees per update (fast but smooth centering)
+SERVO_MAX_SPEED = 3      # Max degrees per update (reduced overshoot near deadband)
 MAX_SPEED = SERVO_MAX_SPEED  # Alias (Issue #7)
 SMOOTHING_FACTOR = 0.45  # EMA on raw error: lower = smoother (less jitter)
 SERVO_OUTPUT_SMOOTHING = 0.55  # EMA alpha on the OUTPUT angle command

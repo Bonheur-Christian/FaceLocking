@@ -73,6 +73,7 @@ class PanTracker:
         self._sweep_stop.set()          # Not sweeping at startup
         self._sweep_thread: Optional[threading.Thread] = None
         self._sweep_from_zero: bool = True   # First sweep after reset() starts at 0°
+        self._search_cancelled: bool = False  # Blocks search() until target lost
 
     # ── properties ────────────────────────────────────────────────────────────
 
@@ -87,6 +88,11 @@ class PanTracker:
     def is_searching(self) -> bool:
         """True while the background sweep thread is alive."""
         return self._sweep_thread is not None and self._sweep_thread.is_alive()
+
+    @property
+    def search_cancelled(self) -> bool:
+        """True after target acquisition until arm_search() is called."""
+        return self._search_cancelled
 
     def normalized_error(self, face_center_x: float, frame_width: int) -> float:
         return (face_center_x - frame_width / 2.0) / (frame_width / 2.0)
@@ -113,20 +119,35 @@ class PanTracker:
         self.center_locked = False
         self.search_manual = False
         self._sweep_from_zero = True   # Next search sweep begins at 0°
+        self._search_cancelled = False
+        self._search_cancelled = False
 
     # ── SEARCH — background thread ─────────────────────────────────────────
 
-    def hold(self, reason: str = "target spotted") -> Tuple[str, None]:
-        """Stop search sweep and freeze the servo at the current position."""
+    def cancel_search(self, reason: str = "target acquired") -> Tuple[str, None]:
+        """
+        Immediately stop all search/sweep activity and freeze at current angle.
+
+        This is the single entry point for target acquisition — it stops the PC
+        sweep thread, cancels ESP search mode, and publishes a hold angle so
+        stale waypoints cannot keep the servo moving.
+        """
+        self._search_cancelled = True
         self._stop_sweep()
+        hold_angle = int(round(self.current_angle))
+        self.target_angle = float(hold_angle)
+        self._smooth_angle = float(hold_angle)
+        self.smoothed_error = None
+        self.prev_error = 0.0
         if self.mqtt:
-            self.mqtt.stop_search()
-        self._holding = True
-        self.target_angle = float(self.current_angle)
-        self._smooth_angle = float(self.current_angle)
+            self.mqtt.cancel_search(hold_angle)
         if self.log:
-            self.log.servo_hold(self.current_angle, reason)
+            self.log.servo_hold(hold_angle, reason)
         return ("holding", None)
+
+    def hold(self, reason: str = "target spotted") -> Tuple[str, None]:
+        """Alias for cancel_search — freeze servo immediately."""
+        return self.cancel_search(reason)
 
     def search(self) -> Tuple[str, Optional[int]]:
         """
@@ -136,6 +157,8 @@ class PanTracker:
         state is safe; it only launches the thread once. The sweep continues
         completely independently until reset() is called.
         """
+        if self._search_cancelled:
+            return ("holding", None)
         if not self.mqtt:
             if self.log:
                 self.log.servo_hold(self.current_angle, "MQTT not connected — sweep paused")
@@ -143,6 +166,10 @@ class PanTracker:
         if not self.is_searching:
             self._start_sweep()
         return ("searching", None)
+
+    def arm_search(self) -> None:
+        """Re-enable search after the locked target is lost."""
+        self._search_cancelled = False
 
     def _start_sweep(self) -> None:
         """Launch the background sweep thread."""
@@ -212,12 +239,13 @@ class PanTracker:
                 pos = float(lo)
                 direction = 1
 
+            # Exit before publishing if search was cancelled while we slept.
+            if self._sweep_stop.is_set() or self._search_cancelled:
+                break
+
             # Publish directly, bypassing the main-thread rate limiter.
-            if self.mqtt:
-                if self.mqtt.is_connected:
-                    self.mqtt.sweep_move(int(pos))
-                # If disconnected: just wait — do NOT exit the sweep loop.
-                # The servo will resume sweeping as soon as MQTT reconnects.
+            if self.mqtt and self.mqtt.is_connected:
+                self.mqtt.sweep_move(int(pos))
 
             # Interruptible sleep. Event.wait(timeout) returns immediately
             # when _sweep_stop is set, making the thread exit fast.
@@ -232,18 +260,14 @@ class PanTracker:
         STOP CONDITION: the servo holds ONLY when |error| <= CENTER_DEADBAND.
         Off-centre detected face => servo KEEPS MOVING toward the target.
         """
-        # First call with a confirmed target: stop the sweep.
-        if self.is_searching:
-            self._stop_sweep()
-            if self.mqtt:
-                self.mqtt.stop_search()
-            # Seed PID from current physical position to avoid a jump.
-            self.target_angle = float(self.current_angle)
-            self._smooth_angle = float(self.current_angle)
-            self.smoothed_error = None
-            self._holding = False
-
         raw_error = self.normalized_error(face_center_x, frame_width)
+        err_px = abs(face_center_x - frame_width / 2.0)
+
+        # Ensure search is fully cancelled before any tracking command.
+        if self.is_searching or (
+            self.mqtt and self.mqtt._search_requested and not self._search_cancelled
+        ):
+            self.cancel_search("target confirmed — switching to tracking")
 
         # Remember exit direction for search bias on next loss.
         if abs(raw_error) > config.CENTERING_TOLERANCE:
@@ -262,7 +286,6 @@ class PanTracker:
         # _holding = True ONLY when inside CENTER_DEADBAND.
         # Hysteresis: once centred, only resume when face drifts past
         # CENTER_DEADBAND_RESUME, preventing chatter at the boundary.
-        err_px = abs(face_center_x - frame_width / 2.0)
         if self._holding:
             # Currently centred — resume chasing only if drifted far enough.
             if err_px > config.CENTER_DEADBAND_RESUME:
@@ -325,14 +348,19 @@ class PanTracker:
 
         from_angle = self.current_angle
         published = self.mqtt.move_to_angle(command_angle)
-        # If dedup/rate-limit blocked but face is still off-centre, nudge 1°
-        # toward the error so the servo never stalls while tracking.
-        if not published and abs(raw_error) > config.CENTERING_TOLERANCE:
+        # Nudge only when clearly outside the resume band — avoids oscillation
+        # near the deadband from forced 1° corrections.
+        if (
+            not published
+            and err_px > config.CENTER_DEADBAND_RESUME
+            and abs(raw_error) > config.CENTERING_TOLERANCE
+        ):
             nudge = command_angle + (1 if raw_error > 0 else -1)
             nudge = int(_clamp(nudge, config.SERVO_MIN_ANGLE, config.SERVO_MAX_ANGLE))
-            published = self.mqtt.move_to_angle(nudge, force=True)
-            if published:
-                command_angle = nudge
+            if nudge != self.mqtt.commanded_angle:
+                published = self.mqtt.move_to_angle(nudge, force=True)
+                if published:
+                    command_angle = nudge
 
         if published:
             if self.log:
@@ -352,9 +380,10 @@ class PanTracker:
         """Toggle manual search (keyboard shortcut 's')."""
         self.search_manual = not self.search_manual
         if self.search_manual:
+            self.arm_search()
             self.search()
         else:
-            self._stop_sweep()
+            self.cancel_search("manual search off")
 
     def force_center(self) -> None:
         """Center immediately (keyboard shortcut 'c')."""
