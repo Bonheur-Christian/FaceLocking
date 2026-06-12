@@ -99,7 +99,9 @@ class MQTTCameraController:
 
     def move_to_angle(self, angle: int) -> bool:
         angle = int(max(config.SERVO_MIN_ANGLE, min(config.SERVO_MAX_ANGLE, angle)))
-        if abs(angle - self.current_angle) < 1:
+        # Only skip moves that are genuinely zero change — don't suppress 1° steps,
+        # as they are the result of smooth output-angle EMA from PanTracker.
+        if angle == int(self.current_angle):
             return False
         ok = self._publish(self.topic_horizontal, str(angle))
         if ok:

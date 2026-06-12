@@ -32,6 +32,9 @@
 const char* ssid = "Crux Sacra";
 const char* password = "Nondracositmihidux";
 
+// const char* ssid = "EdNet";
+// const char* password = "Huawei@123";
+
 // MQTT Broker settings
 const char* mqtt_server = "157.173.101.159";  // Your MQTT broker IP
 const int mqtt_port = 1883;
@@ -44,7 +47,7 @@ const char* topic_command = "camera/track/command";
 const char* topic_status = "camera/status";
 
 // Servo settings
-const int SERVO_PIN = 2;  // GPIO2
+const int SERVO_PIN = 12;  // GPIO12
 const int SERVO_MIN_ANGLE = 0;
 const int SERVO_MAX_ANGLE = 180;
 const int SERVO_CENTER_ANGLE = 90;
@@ -55,6 +58,13 @@ const int MOVEMENT_DELAY = 15;  // ms delay between servo steps for smooth movem
 
 // Debug mode
 #define DEBUG true
+const int SERIAL_PRINT_DELAY = 30;  // ms pause after serial lines (keeps monitor readable)
+
+#if DEBUG
+void serialPause() { delay(SERIAL_PRINT_DELAY); }
+#else
+void serialPause() {}
+#endif
 
 // ============================================================================
 // GLOBAL VARIABLES
@@ -222,6 +232,7 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
   Serial.print(topic);
   Serial.print("]: ");
   Serial.println(message);
+  serialPause();
 
   // Handle horizontal position (degrees)
   if (strcmp(topic, topic_horizontal) == 0) {
@@ -234,10 +245,12 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
         Serial.print(currentAngle);
         Serial.print(" | New Target: ");
         Serial.println(targetAngle);
+        serialPause();
       }
 
       Serial.print("→ Target angle set to: ");
       Serial.println(targetAngle);
+      serialPause();
     } else {
       Serial.println("✗ Invalid angle (must be 0-180)");
     }
@@ -252,14 +265,17 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
       targetAngle = constrain(currentAngle - SERVO_STEP_SIZE, SERVO_MIN_ANGLE, SERVO_MAX_ANGLE);
       Serial.print("← Moving left to: ");
       Serial.println(targetAngle);
+      serialPause();
     } else if (command == "right" || command == "move_right") {
       targetAngle = constrain(currentAngle + SERVO_STEP_SIZE, SERVO_MIN_ANGLE, SERVO_MAX_ANGLE);
       Serial.print("→ Moving right to: ");
       Serial.println(targetAngle);
+      serialPause();
     } else if (command == "center") {
       targetAngle = SERVO_CENTER_ANGLE;
       Serial.print("⊙ Centering to: ");
       Serial.println(targetAngle);
+      serialPause();
     } else {
       Serial.print("✗ Unknown command: ");
       Serial.println(command);
@@ -279,15 +295,22 @@ void updateServoPosition() {
       Serial.print(currentAngle);
       Serial.print(" -> Target: ");
       Serial.println(targetAngle);
+      serialPause();
     }
 
     // Determine direction
     if (currentAngle < targetAngle) {
       currentAngle++;
-      if (DEBUG) Serial.println("➡ Direction: RIGHT (+1)");
+      if (DEBUG) {
+        Serial.println("➡ Direction: RIGHT (+1)");
+        serialPause();
+      }
     } else if (currentAngle > targetAngle) {
       currentAngle--;
-      if (DEBUG) Serial.println("⬅ Direction: LEFT (-1)");
+      if (DEBUG) {
+        Serial.println("⬅ Direction: LEFT (-1)");
+        serialPause();
+      }
     }
 
     cameraServo.write(currentAngle);
@@ -295,6 +318,7 @@ void updateServoPosition() {
     if (DEBUG) {
       Serial.print("📍 Servo now at: ");
       Serial.println(currentAngle);
+      serialPause();
     }
 
     delay(MOVEMENT_DELAY);
@@ -304,6 +328,7 @@ void updateServoPosition() {
       Serial.println("✅ Movement Complete");
       Serial.print("🎯 Final Position: ");
       Serial.println(currentAngle);
+      serialPause();
       publishStatus();
     }
   }
@@ -323,6 +348,7 @@ void publishStatus() {
   if (DEBUG) {
     Serial.print("📤 Published Status: ");
     Serial.println(status);
+    serialPause();
   }
 }
 

@@ -184,6 +184,7 @@ def main(
     ACTION_DISPLAY_DURATION = 15
 
     lost_since: Optional[float] = None
+    locked_unrecog_since: Optional[float] = None  # track visible but not recognised as target
     prev_locked_track_id: Optional[int] = None
     state = "IDLE"
 
@@ -257,17 +258,25 @@ def main(
                 visible = tracker.visible_tracks()
             faces_present = bool(visible)
 
-            # --- Recognition pass (cached; locked first) -------------------
+            # --- Recognition pass (locked track first; budget caps cost) -----
             locked = tracker.locked_track
             ordered = sorted(
                 visible,
                 key=lambda t: (t.track_id != tracker.locked_track_id, t.track_id),
             )
-            budget = config.MAX_FACES
+            # During active search, only re-recognise the formerly locked track
+            # so the budget is not wasted on bystanders.
+            is_searching_now = (state == "SEARCHING")
+            budget = config.MAX_FACES_TO_PROCESS
             for tr in ordered:
                 if budget <= 0:
                     break
                 is_lk = tr.track_id == tracker.locked_track_id
+                if is_searching_now and not is_lk:
+                    # During search still process unknown faces — they might be the target
+                    # returning with a new track ID — but deprioritise known bystanders.
+                    if tr.accepted and tr.name != lock_name:
+                        continue
                 if tr.needs_recognition(frame_idx, is_lk, faces_present=faces_present):
                     name, dist, accepted = recognize_face(
                         frame, tr.landmarks, aligner, embedder,
@@ -281,18 +290,31 @@ def main(
             if lock_name and tracker.locked_track_id is None:
                 candidate = tracker.acquire_lock(lock_name)
                 if candidate is not None:
-                    pan.reset()  # drop any search sweep, resume clean tracking
+                    pan.reset()  # cancel search sweep; resume clean tracking
+                    locked_unrecog_since = None
                     print(f"✓ Locked onto {lock_name} (track #{candidate.track_id})")
 
             locked = tracker.locked_track
+
+            # Determine whether the locked track is genuinely confirmed.
+            # A track that exists but is labelled Unknown (e.g. person stepped back
+            # and recognition failed) is NOT treated as "confirmed visible".
+            locked_confirmed = (
+                locked is not None
+                and locked.accepted
+                and locked.name == lock_name
+            )
 
             # --- Servo control + state machine -----------------------------
             if not lock_name:
                 state = "IDLE"
                 lost_since = None
+                locked_unrecog_since = None
                 prev_locked_track_id = None
                 tlog.idle()
-            elif locked is not None:
+
+            elif locked_confirmed:
+                # ── Target is visible AND recognised ──────────────────────
                 if prev_locked_track_id is None and lost_since is not None:
                     tlog.target_visible(
                         lock_name, locked.track_id, locked.center, pan.current_angle,
@@ -302,11 +324,45 @@ def main(
                         lock_name, locked.track_id, locked.center, pan.current_angle,
                     )
                 lost_since = None
+                locked_unrecog_since = None
                 prev_locked_track_id = locked.track_id
                 label, _ = pan.track(locked.center[0], frame_w)
                 state = "LOCKED" if label == "centered" else "TRACKING"
+
+            elif locked is not None and not locked_confirmed:
+                # ── Track exists but identity not yet confirmed ───────────
+                # Could be: (a) new track not yet embedded, (b) person stepped
+                # back and recognition degraded.  Give it LOST_TARGET_UNRECOGNIZED_SEC
+                # then escalate to search.
+                if locked_unrecog_since is None:
+                    locked_unrecog_since = time.time()
+                unrecog_for = time.time() - locked_unrecog_since
+
+                if unrecog_for < config.LOST_TARGET_UNRECOGNIZED_SEC:
+                    # Tentative: keep servo following the track while hoping
+                    # recognition recovers.  State shown as TRACKING (yellow).
+                    pan.track(locked.center[0], frame_w)
+                    state = "TRACKING"
+                    tlog.target_still_missing(lock_name, unrecog_for)
+                else:
+                    # Recognition failed too long — enter search.
+                    if lost_since is None:
+                        lost_since = time.time()
+                        prev_locked_track_id = None
+                        tlog.target_lost(lock_name)
+                    if state != "SEARCHING":
+                        direction = (
+                            "right" if pan.last_error_sign > 0
+                            else "left" if pan.last_error_sign < 0
+                            else "center"
+                        )
+                        tlog.search_started(lock_name, pan.last_known_angle, direction)
+                    state = "SEARCHING"
+                    pan.search()
+
             else:
-                # Locked identity selected but its track is not currently bound.
+                # ── Track is gone entirely ────────────────────────────────
+                locked_unrecog_since = None
                 if lost_since is None:
                     lost_since = time.time()
                     prev_locked_track_id = None
@@ -314,20 +370,28 @@ def main(
                 lost_for = time.time() - lost_since
                 if lost_for >= config.LOST_TARGET_TIMEOUT or pan.search_manual:
                     if state != "SEARCHING":
-                        direction = "right" if pan.last_error_sign > 0 else "left" if pan.last_error_sign < 0 else "center"
+                        direction = (
+                            "right" if pan.last_error_sign > 0
+                            else "left" if pan.last_error_sign < 0
+                            else "center"
+                        )
                         tlog.search_started(lock_name, pan.last_known_angle, direction)
                     state = "SEARCHING"
                     pan.search()
                 else:
-                    state = "TRACKING"  # brief grace period: hold position
+                    # Brief grace period — hold position before starting sweep.
+                    state = "TRACKING"
                     tlog.target_still_missing(lock_name, lost_for)
-                    tlog.servo_hold(pan.current_angle, "target out of frame — holding during grace period")
+                    tlog.servo_hold(
+                        pan.current_angle,
+                        "target out of frame — holding during grace period",
+                    )
 
             # --- Activity logging for the locked, visible target -----------
             if (
-                lock_name and activity_logger and locked is not None
+                lock_name and activity_logger and locked_confirmed
                 and frame_idx % config.ACTION_DETECT_EVERY_N_FRAMES == 0
-                and locked.full_landmarks
+                and locked is not None and locked.full_landmarks
             ):
                 detected_actions, baseline_mouth_width, mouth_width_samples = action_module.detect_smile_blink(
                     frame, baseline_mouth_width, mouth_width_samples,
@@ -424,6 +488,7 @@ def main(
                 tracker.release_lock()
                 pan.reset()
                 lost_since = None
+                locked_unrecog_since = None
                 print("Lock cleared")
             elif key == ord("k"):
                 new_lock = choose_lock_identity(names)
@@ -431,6 +496,8 @@ def main(
                     lock_name = new_lock
                     tracker.release_lock()
                     pan.reset()
+                    lost_since = None
+                    locked_unrecog_since = None
                     if activity_logger is None:
                         activity_logger = ActivityLogger(lock_name, config.HISTORY_DIR)
                     print(f"Lock target set to {lock_name}")

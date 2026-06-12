@@ -1,9 +1,8 @@
 {
-  "timestamp": "2026-06-11 17:57:33",
+  "timestamp": "2026-06-12 06:48:22",
   "embedding_dim": 512,
   "names": [
-    "bonheur",
-    "pazzo"
+    "bonheur"
   ],
-  "samples_used": 16
+  "samples_used": 34
 }

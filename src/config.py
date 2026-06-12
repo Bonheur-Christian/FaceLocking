@@ -36,8 +36,8 @@ FACE_LANDMARKER_MODEL_PATH = MODELS_DIR / "face_landmarker.task"
 HAAR_CASCADE_PATH = None  # None = use OpenCV default haarcascade_frontalface_default.xml
 HAAR_SCALE_FACTOR = 1.15  # Larger step = fewer Haar passes (faster)
 HAAR_MIN_NEIGHBORS = 4
-HAAR_MIN_SIZE = (80, 80)
-DETECT_FRAME_SCALE = 0.55  # Run detection on downscaled frame (big speedup)
+HAAR_MIN_SIZE = (50, 50)
+DETECT_FRAME_SCALE = 0.75  # Run detection on downscaled frame (big speedup)
 HAAR_FLAGS = None  # cv2.CASCADE_SCALE_IMAGE if needed
 
 # ============================================================================
@@ -66,7 +66,7 @@ ALIGNMENT_OUTPUT_SIZE: Tuple[int, int] = (112, 112)  # Standard for ArcFace
 ALIGNMENT_PAD_X = 0.55
 ALIGNMENT_PAD_Y_TOP = 0.85
 ALIGNMENT_PAD_Y_BOT = 1.15
-MIN_EYE_DISTANCE = 12.0  # Pixels; sanity check for geometry
+MIN_EYE_DISTANCE = 8.0  # Pixels; sanity check for geometry
 
 # ============================================================================
 # ARCFACE EMBEDDING SETTINGS
@@ -96,19 +96,19 @@ SAVE_ENROLLMENT_CROPS = True
 # RECOGNITION & THRESHOLD SETTINGS
 # ============================================================================
 
-DEFAULT_DISTANCE_THRESHOLD = 0.50  # Cosine distance; lower = stricter / more accurate
+DEFAULT_DISTANCE_THRESHOLD = 0.52  # Cosine distance; lower = stricter / more accurate
 SIMILARITY_THRESHOLD = 0.70  # 1 - distance_threshold (for reference)
 TARGET_FAR = 0.01  # 1% False Accept Rate for threshold tuning
 THRESHOLD_SWEEP_RANGE = (0.10, 1.20, 0.01)  # (start, end, step)
 
 # Aliases for the canonical recognition tuning interface (Issue #7)
 RECOGNITION_THRESHOLD = DEFAULT_DISTANCE_THRESHOLD  # Accept identity if dist <= this
-FACE_MATCH_THRESHOLD = 0.50  # Looser gate used to keep an existing lock alive
+FACE_MATCH_THRESHOLD = 0.55  # Looser gate used to keep an existing lock alive
 MAX_FACES = 5  # Maximum simultaneous faces to detect/recognize
 RECOGNITION_INTERVAL = 4
 RECOGNITION_INTERVAL_LOCKED = 2
 RECOGNITION_INTERVAL_FACE = 4  # Re-embed every N frames while face visible
-RECOGNITION_INTERVAL_LOCKED_FACE = 2
+RECOGNITION_INTERVAL_LOCKED_FACE = 1   # Re-embed locked track every frame for fastest re-lock
 RECOGNITION_INTERVAL_IDLE = 20
 RECOGNITION_COOLDOWN_FRAMES = 4
 RECOGNITION_COOLDOWN_FRAMES_FACE = 3
@@ -130,7 +130,7 @@ SMOOTHING_WINDOW = 5  # EMA smoothing for face center X
 ACCEPT_HOLD_FRAMES = 10  # Keep boxes/labels alive between skipped frames
 MAX_FACES_TO_PROCESS = 2  # Cap embed cost in crowded scenes
 LOCK_CONFIDENCE_MAX_DISTANCE = 0.45  # Maintain lock while distance <= this
-LOCK_RELEASE_DISTANCE = 0.50  # Drop lock if distance exceeds this
+LOCK_RELEASE_DISTANCE = 0.58 # Drop lock if distance exceeds this
 
 # ============================================================================
 # CAMERA SETTINGS
@@ -138,8 +138,8 @@ LOCK_RELEASE_DISTANCE = 0.50  # Drop lock if distance exceeds this
 
 CAMERA_INDEX = 1  # Use python -m src.camera_utils to find the right index
 CAMERA_AUTO_DETECT = True  # Fall back to other indices if CAMERA_INDEX fails
-CAMERA_FRAME_WIDTH = 480
-CAMERA_FRAME_HEIGHT = 360
+CAMERA_FRAME_WIDTH = 640
+CAMERA_FRAME_HEIGHT = 480
 CAMERA_FPS_TARGET = 30
 CAMERA_OPEN_VERIFY_FRAMES = 5  # Test reads when opening
 CAMERA_READ_RETRIES = 5  # Per-frame read attempts before counting a failure
@@ -196,7 +196,7 @@ MQTT_TOPIC_COMMAND = "camera/track/command"
 MQTT_TOPIC_STATUS = "camera/status"
 MQTT_KEEPALIVE = 30
 MQTT_QOS = 1
-MQTT_MIN_COMMAND_INTERVAL_MS = 50
+MQTT_MIN_COMMAND_INTERVAL_MS = 30  # Max ~33 servo commands/sec
 
 # ----------------------------------------------------------------------------
 # SERVO CONTROL (must match ESP8266 firmware limits)
@@ -214,28 +214,29 @@ CENTER_ANGLE = SERVO_CENTER_ANGLE
 SERVO_DIRECTION_SIGN = 1
 
 # PID-style pan controller (operates on normalized horizontal error in [-1, 1])
-SERVO_PID_KP = 26.0   # Proportional gain (deg per unit normalized error)
+SERVO_PID_KP = 22.0   # Proportional gain — reduced from 26 to prevent overshoot
 SERVO_PID_KI = 0.0    # Integral gain (kept 0 by default to avoid windup)
-SERVO_PID_KD = 7.0    # Derivative gain (damps oscillation)
+SERVO_PID_KD = 5.0    # Derivative gain — reduced from 7 for less jitter
 SERVO_PID_I_CLAMP = 8.0  # Max absolute integral contribution (deg)
 
 # Rate limiting / smoothing
-SERVO_MAX_SPEED = 12     # Max degrees the servo target may change per update (rate limit)
+SERVO_MAX_SPEED = 20     # Max degrees the servo target may change per update
 MAX_SPEED = SERVO_MAX_SPEED  # Alias (Issue #7)
-SMOOTHING_FACTOR = 0.5   # EMA factor for the measured error (0=frozen, 1=no smoothing)
+SMOOTHING_FACTOR = 0.7   # EMA on raw error: higher = faster response (was 0.5)
+SERVO_OUTPUT_SMOOTHING = 0.30  # EMA alpha on the OUTPUT angle command (prevents jitter)
 SERVO_STEP_SIZE = 5      # Manual nudge step (left/right keys, command mode)
-SERVO_MAX_PAN_OFFSET = 75  # Max degrees from center when tracking (wider follow range)
+SERVO_MAX_PAN_OFFSET = 90  # Max degrees from center when tracking
 
-# Dead zone: ignore tiny face offsets so the servo stays still when centered.
-CENTER_DEAD_ZONE = 25  # Pixels of half-width tolerance around frame center
-SERVO_DEAD_ZONE_NORMALIZED = 0.08  # Legacy normalized fallback
+# Dead zone: servo holds only when face is within this many pixels of frame center.
+CENTER_DEAD_ZONE = 20  # Pixels (was 25 — tighter so servo chases sooner)
+SERVO_DEAD_ZONE_NORMALIZED = 0.06  # Legacy normalized fallback
 
 # ----------------------------------------------------------------------------
 # TRACKING BEHAVIOR
 # ----------------------------------------------------------------------------
 ENABLE_AUTO_CENTERING = True  # Continuous pan to keep locked face centered
-CENTERING_TOLERANCE = 0.10    # Normalized half-width counted as "centered"
-FRAMES_TO_LOCK_CENTER = 8     # Frames inside center zone before "centered" state
+CENTERING_TOLERANCE = 0.08    # Normalized half-width counted as "centered" (was 0.10)
+FRAMES_TO_LOCK_CENTER = 6     # Frames inside center zone before "centered" state (was 8)
 
 # Legacy step-based mode (kept for compatibility; PID path is preferred)
 MOVEMENT_BASED_TRACKING = False
@@ -245,18 +246,20 @@ TRACKING_MOVEMENT_THRESHOLD = 0.05
 # ----------------------------------------------------------------------------
 # LOST-TARGET SEARCH & REACQUISITION (Issues #4, #5)
 # ----------------------------------------------------------------------------
-LOST_TARGET_TIMEOUT = 0.8        # Seconds target may be missing before SEARCH_MODE
-LOST_TARGET_FRAMES = 8           # Frames a track may be missing before it is dropped
+LOST_TARGET_TIMEOUT = 0.3        # Seconds target may be missing (track gone) before SEARCH
+LOST_TARGET_FRAMES = 4           # Frames a track may be missing before it is dropped
+# If locked track stays visible but is unrecognized for this long → treat as lost
+LOST_TARGET_UNRECOGNIZED_SEC = 1.5
 
-# Search sweep — full 0°–180° coverage (wider than old 15°–165° range)
+# Search sweep — full 0°–180° coverage
 SEARCH_MIN_ANGLE = 0
 SEARCH_MAX_ANGLE = 180
-SEARCH_SWEEP_SPEED = 100.0       # Degrees per second between sweep waypoints
-SEARCH_SWEEP_STEP = 10           # Degrees per step (18 stops across full sweep)
+SEARCH_SWEEP_SPEED = 120.0       # Degrees per second (was 100 — faster search)
+SEARCH_SWEEP_STEP = 8            # Degrees per step (was 10 — finer steps)
 SEARCH_START_DIRECTION = "last"  # "last" | "left" | "right" — where to look first
 SEARCH_EXPAND_ENABLED = True     # Expand outward from last-known angle before full sweep
 SEARCH_REACQUIRE_FRAMES = 2      # Frames the original target must be re-seen to re-lock
-SEARCH_ENDPOINT_DWELL_SEC = 0.4  # Pause at each sweep edge for camera to settle
+SEARCH_ENDPOINT_DWELL_SEC = 0.15 # Pause at each sweep edge for camera to settle (was 0.2)
 
 # Legacy fixed sweep (used only if SEARCH_EXPAND_ENABLED is False)
 FRAMES_BEFORE_SEARCH = 24
